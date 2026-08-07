@@ -13,6 +13,7 @@ from typing import List, Tuple
 
 import numpy as np
 import streamlit as st
+from sklearn.feature_extraction.text import HashingVectorizer
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -20,11 +21,48 @@ import config
 from utils import Paper
 
 
+class _OfflineHashingEmbeddingModel:
+    """Offline fallback used when no SentenceTransformer model is cached.
+
+    It keeps the app runnable without network access by mapping texts into a
+    fixed hashing vector space. The vectors are not as strong as a true
+    sentence model, but they preserve the ranking / clustering pipeline.
+    """
+
+    def __init__(self) -> None:
+        self.vectorizer = HashingVectorizer(
+            n_features=4096,
+            alternate_sign=False,
+            norm="l2",
+            ngram_range=(1, 2),
+            lowercase=True,
+        )
+
+    def encode(self, texts, normalize_embeddings=True, show_progress_bar=False):  # noqa: D401, ARG002
+        vectors = self.vectorizer.transform(texts).astype(np.float32)
+        return vectors.toarray()
+
+
+def _load_sentence_transformer(model_name: str, local_only: bool = False) -> SentenceTransformer:
+    return SentenceTransformer(model_name, local_files_only=local_only)
+
+
 @st.cache_resource(show_spinner="Loading embedding model (BAAI/bge-large-en-v1.5)...")
-def get_embedding_model() -> SentenceTransformer:
+def get_embedding_model():
     """Load once per Streamlit session/process - this model is ~1.3GB and
-    should never be reloaded on every rerun of the script."""
-    return SentenceTransformer(config.EMBEDDING_MODEL_NAME)
+    should never be reloaded on every rerun of the script.
+    First tries local cache (fast), then downloads from HuggingFace if not cached,
+    finally falls back to a lightweight hashing model if all else fails."""
+    # 1. Try local cache first (fastest, works offline)
+    try:
+        return _load_sentence_transformer(config.EMBEDDING_MODEL_NAME, local_only=True)
+    except Exception:
+        pass
+    # 2. Try downloading from HuggingFace (first-time setup)
+    try:
+        return _load_sentence_transformer(config.EMBEDDING_MODEL_NAME, local_only=False)
+    except Exception:  # noqa: BLE001 - offline fallback must keep the app running
+        return _OfflineHashingEmbeddingModel()
 
 
 def embed_texts(texts: List[str], is_query: bool = False) -> np.ndarray:

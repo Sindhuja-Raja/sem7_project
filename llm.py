@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import time
+from functools import lru_cache
 from typing import Optional
 
 import requests
@@ -144,8 +145,10 @@ def _call_groq(
     return None
 
 
+@lru_cache(maxsize=512)
 def summarize_paper(title: str, abstract: str) -> str:
-    """Produce a short plain-language summary of a paper for display."""
+    """Produce a short plain-language summary of a paper for display.
+    Results are cached by (title, abstract) — same paper never hits Groq twice."""
     if not abstract:
         return "No abstract available from the source API."
 
@@ -170,8 +173,10 @@ def summarize_paper(title: str, abstract: str) -> str:
     return abstract[:300] + ("..." if len(abstract) > 300 else "")
 
 
+@lru_cache(maxsize=512)
 def explain_relevance(query: str, title: str, abstract: str) -> str:
-    """Explain in 1-2 sentences why this paper is relevant to the query."""
+    """Explain in 1-2 sentences why this paper is relevant to the query.
+    Results are cached by (query, title, abstract) — no duplicate Groq calls."""
     content = _call_groq(
         messages=[
             {
@@ -197,3 +202,10 @@ def explain_relevance(query: str, title: str, abstract: str) -> str:
     if content:
         return content
     return "AI relevance explanation unavailable (no LLM API key configured)."
+
+
+def clear_llm_cache() -> None:
+    """Clear both LRU caches — call between unrelated searches if memory is a concern."""
+    summarize_paper.cache_clear()
+    explain_relevance.cache_clear()
+

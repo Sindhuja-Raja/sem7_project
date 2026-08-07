@@ -45,6 +45,7 @@ from typing import Dict, List, Optional, Tuple
 import faiss
 import numpy as np
 import streamlit as st
+from sklearn.feature_extraction.text import HashingVectorizer
 from sentence_transformers import SentenceTransformer
 
 import config
@@ -53,6 +54,29 @@ from utils import Paper
 logger = logging.getLogger(__name__)
 
 NOT_FOUND_IN_CONTEXT = "Not Found in Retrieved Context"
+
+
+class _OfflineHashingEmbeddingModel:
+    """Offline fallback used when neither SentenceTransformer model is cached."""
+
+    def __init__(self) -> None:
+        self.tokenizer = _WhitespaceTokenizer()
+        self.vectorizer = HashingVectorizer(
+            n_features=4096,
+            alternate_sign=False,
+            norm="l2",
+            ngram_range=(1, 2),
+            lowercase=True,
+        )
+
+    def encode(self, texts, normalize_embeddings=True, show_progress_bar=False):  # noqa: D401, ARG002
+        vectors = self.vectorizer.transform(texts).astype(np.float32)
+        return vectors.toarray()
+
+
+class _WhitespaceTokenizer:
+    def encode(self, text: str, add_special_tokens: bool = False):  # noqa: D401, ARG002
+        return re.findall(r"\w+|[^\w\s]", text or "")
 
 
 @dataclass
@@ -195,18 +219,41 @@ def chunk_sections(paper_id: str, sections: Dict[str, str]) -> List[Chunk]:
 def get_chunk_embedding_model():
     """Returns (tokenizer, model, model_name). Cached once per process -
     this is the "generate embeddings only once per session" requirement
-    applied to the model itself, not just the per-paper chunk vectors."""
+    applied to the model itself, not just the per-paper chunk vectors.
+    Tries local cache first, then downloads from HuggingFace, then uses hashing fallback."""
+    # 1. Try primary model from local cache
     try:
-        model = SentenceTransformer(config.RAG_CHUNK_EMBEDDING_MODEL)
-        name = config.RAG_CHUNK_EMBEDDING_MODEL
-    except Exception as exc:  # noqa: BLE001 - must never crash the app over a model download
+        model = SentenceTransformer(config.RAG_CHUNK_EMBEDDING_MODEL, local_files_only=True)
+        return model.tokenizer, model, config.RAG_CHUNK_EMBEDDING_MODEL
+    except Exception:
+        pass
+    # 2. Try downloading primary model from HuggingFace
+    try:
+        model = SentenceTransformer(config.RAG_CHUNK_EMBEDDING_MODEL, local_files_only=False)
+        return model.tokenizer, model, config.RAG_CHUNK_EMBEDDING_MODEL
+    except Exception as exc:
         logger.warning(
-            "Failed to load %s (%s) - falling back to %s",
+            "Failed to load %s (%s) - trying fallback model %s",
             config.RAG_CHUNK_EMBEDDING_MODEL, exc, config.RAG_CHUNK_EMBEDDING_MODEL_FALLBACK,
         )
-        model = SentenceTransformer(config.RAG_CHUNK_EMBEDDING_MODEL_FALLBACK)
-        name = config.RAG_CHUNK_EMBEDDING_MODEL_FALLBACK
-    return model.tokenizer, model, name
+    # 3. Try fallback model from local cache
+    try:
+        model = SentenceTransformer(config.RAG_CHUNK_EMBEDDING_MODEL_FALLBACK, local_files_only=True)
+        return model.tokenizer, model, config.RAG_CHUNK_EMBEDDING_MODEL_FALLBACK
+    except Exception:
+        pass
+    # 4. Try downloading fallback model
+    try:
+        model = SentenceTransformer(config.RAG_CHUNK_EMBEDDING_MODEL_FALLBACK, local_files_only=False)
+        return model.tokenizer, model, config.RAG_CHUNK_EMBEDDING_MODEL_FALLBACK
+    except Exception as fallback_exc:
+        logger.warning(
+            "Failed to load %s (%s) - using offline hashing fallback",
+            config.RAG_CHUNK_EMBEDDING_MODEL_FALLBACK, fallback_exc,
+        )
+    # 5. Final fallback: hashing model
+    model = _OfflineHashingEmbeddingModel()
+    return model.tokenizer, model, "offline-hashing-fallback"
 
 
 def _embed(texts: List[str], is_query: bool) -> np.ndarray:

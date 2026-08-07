@@ -29,6 +29,7 @@ class Paper:
     doi: Optional[str] = None
     abstract: str = ""
     pdf_url: Optional[str] = None
+    publisher: Optional[str] = None
 
     # populated later by the ranking pipeline
     similarity_score: float = 0.0

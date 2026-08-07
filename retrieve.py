@@ -6,12 +6,18 @@ Each `fetch_<source>` function takes a search query and returns a
 List[Paper]. All five are called concurrently by `fetch_all_sources`
 via a thread pool, since these are I/O-bound network calls.
 
+Pagination is implemented for every source so that up to
+config.RESULTS_PER_SOURCE papers can be returned per source (where
+individual API page sizes are smaller than the target, multiple pages
+are fetched sequentially).
+
 A source that errors out (bad key, timeout, rate limit) never crashes
 the pipeline - it just contributes zero results and the failure is
 reported back to the caller for display in the UI.
 """
 
 import logging
+import math
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -91,47 +97,103 @@ def _reconstruct_openalex_abstract(inverted_index: Optional[dict]) -> str:
     return " ".join(word for _, word in positions)
 
 
+# OpenAlex hard caps per_page at 100 — paginate to reach the target.
+_OPENALEX_PAGE_SIZE = 100
+
+
+def filter_papers_by_metadata(
+    papers: List[Paper], year_from: Optional[int] = None, year_to: Optional[int] = None,
+    publishers: Optional[List[str]] = None,
+) -> List[Paper]:
+    """Filter already-fetched papers by year range and publisher name."""
+    publishers = [p.strip().lower() for p in (publishers or []) if p and str(p).strip()]
+    filtered = []
+    for paper in papers:
+        if year_from is not None and (paper.year is None or paper.year < year_from):
+            continue
+        if year_to is not None and (paper.year is None or paper.year > year_to):
+            continue
+        if publishers:
+            publisher = (paper.publisher or "").strip().lower()
+            if publisher not in publishers:
+                continue
+        filtered.append(paper)
+    return filtered
+
+
 def fetch_openalex(query: str, limit: int = config.RESULTS_PER_SOURCE) -> List[Paper]:
-    params = {"search": query, "per_page": limit}
-    if config.CONTACT_EMAIL:
-        params["mailto"] = config.CONTACT_EMAIL
+    """Fetch up to `limit` papers from OpenAlex, paginating as needed
+    (OpenAlex per_page max = 100)."""
+    papers: List[Paper] = []
+    page = 1
+    remaining = limit
+    
+    while remaining > 0:
+        page_size = min(_OPENALEX_PAGE_SIZE, remaining)
+        params = {
+            "search": query,
+            "per_page": page_size,
+            "page": page,
+        }
+        if config.CONTACT_EMAIL:
+            params["mailto"] = config.CONTACT_EMAIL
 
-    resp = requests.get(
-        "https://api.openalex.org/works",
-        params=params,
-        timeout=config.REQUEST_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
+        try:
+            resp = requests.get(
+                "https://api.openalex.org/works",
+                params=params,
+                timeout=config.REQUEST_TIMEOUT_SECONDS,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("OpenAlex page %d failed: %s", page, exc)
+            break
 
-    papers = []
-    for item in results:
-        authors = [
-            a["author"]["display_name"]
-            for a in item.get("authorships", [])
-            if a.get("author", {}).get("display_name")
-        ]
-        pdf_url = None
-        oa = item.get("open_access") or {}
-        if oa.get("oa_url"):
-            pdf_url = oa["oa_url"]
-        elif item.get("primary_location", {}).get("pdf_url"):
-            pdf_url = item["primary_location"]["pdf_url"]
+        results = resp.json().get("results", [])
+        if not results:
+            break  # No more results
 
-        papers.append(Paper(
-            title=item.get("title") or "",
-            authors=authors,
-            year=item.get("publication_year"),
-            source=config.SOURCE_OPENALEX,
-            doi=item.get("doi"),
-            abstract=_reconstruct_openalex_abstract(item.get("abstract_inverted_index")),
-            pdf_url=pdf_url,
-        ))
-    return papers
+        for item in results:
+            authors = [
+                a["author"]["display_name"]
+                for a in item.get("authorships", [])
+                if a.get("author", {}).get("display_name")
+            ]
+            pdf_url = None
+            oa = item.get("open_access") or {}
+            if oa.get("oa_url"):
+                pdf_url = oa["oa_url"]
+            elif item.get("primary_location", {}).get("pdf_url"):
+                pdf_url = item["primary_location"]["pdf_url"]
+
+            publisher = None
+            if item.get("primary_location"):
+                host = item.get("primary_location", {}).get("source", {}).get("display_name")
+                publisher = host or None
+            papers.append(Paper(
+                title=item.get("title") or "",
+                authors=authors,
+                year=item.get("publication_year"),
+                source=config.SOURCE_OPENALEX,
+                doi=item.get("doi"),
+                abstract=_reconstruct_openalex_abstract(item.get("abstract_inverted_index")),
+                pdf_url=pdf_url,
+                publisher=publisher,
+            ))
+
+        remaining -= len(results)
+        if len(results) < page_size:
+            break  # Last page returned fewer than requested → no more pages
+        page += 1
+        time.sleep(0.1)  # polite delay between pages
+
+    return papers[:limit]
 
 
 # ------------------------------------------------------------------------
 # Crossref - https://api.crossref.org  (no key required)
+# Crossref supports up to 1000 rows per request - no pagination needed
+# for our target limit of 200.
 # ------------------------------------------------------------------------
 
 def _strip_jats_tags(text: str) -> str:
@@ -143,7 +205,11 @@ def _strip_jats_tags(text: str) -> str:
 
 
 def fetch_crossref(query: str, limit: int = config.RESULTS_PER_SOURCE) -> List[Paper]:
-    params = {"query": query, "rows": limit}
+    """Fetch up to `limit` papers from Crossref.
+    Crossref supports rows up to 1000 per request, so a single call suffices."""
+    # Crossref max rows per request = 1000, so we can fetch up to 1000 in one go.
+    rows = min(limit, 1000)
+    params = {"query": query, "rows": rows}
     if config.CONTACT_EMAIL:
         params["mailto"] = config.CONTACT_EMAIL
 
@@ -183,6 +249,10 @@ def fetch_crossref(query: str, limit: int = config.RESULTS_PER_SOURCE) -> List[P
                 pdf_url = link.get("URL")
                 break
 
+        publisher = None
+        container_title = item.get("container-title") or []
+        if container_title:
+            publisher = container_title[0]
         papers.append(Paper(
             title=title,
             authors=authors,
@@ -191,18 +261,22 @@ def fetch_crossref(query: str, limit: int = config.RESULTS_PER_SOURCE) -> List[P
             doi=item.get("DOI"),
             abstract=_strip_jats_tags(item.get("abstract", "")),
             pdf_url=pdf_url or item.get("URL"),
+            publisher=publisher,
         ))
-    return papers
+    return papers[:limit]
 
 
 # ------------------------------------------------------------------------
 # arXiv - https://info.arxiv.org/help/api  (no key required, Atom/XML feed)
+# arXiv supports max_results up to 30,000 - single request suffices.
 # ------------------------------------------------------------------------
 
 _ATOM_NS = "{http://www.w3.org/2005/Atom}"
 
 
 def fetch_arxiv(query: str, limit: int = config.RESULTS_PER_SOURCE) -> List[Paper]:
+    """Fetch up to `limit` papers from arXiv.
+    arXiv supports max_results up to 30,000 in a single request."""
     params = {
         "search_query": f"all:{query}",
         "start": 0,
@@ -253,104 +327,158 @@ def fetch_arxiv(query: str, limit: int = config.RESULTS_PER_SOURCE) -> List[Pape
             doi=None,
             abstract=abstract,
             pdf_url=pdf_url or arxiv_url,
+            publisher="arXiv",
         ))
-    return papers
+    return papers[:limit]
 
 
 # ------------------------------------------------------------------------
 # CORE - https://api.core.ac.uk/docs/v3  (requires a free API key)
+# Paginate using offset to reach target limit.
 # ------------------------------------------------------------------------
 
+_CORE_PAGE_SIZE = 100
+
+
 def fetch_core(query: str, limit: int = config.RESULTS_PER_SOURCE) -> List[Paper]:
+    """Fetch up to `limit` papers from CORE, paginating as needed."""
     if not config.CORE_API_KEY:
         # No key configured - skip this source gracefully rather than failing.
         return []
 
-    resp = requests.get(
-        "https://api.core.ac.uk/v3/search/works/",
-        params={"q": query, "limit": limit},
-        headers={"Authorization": f"Bearer {config.CORE_API_KEY}"},
-        timeout=config.REQUEST_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
+    papers: List[Paper] = []
+    offset = 0
+    remaining = limit
 
-    papers = []
-    for item in results:
-        title = item.get("title") or ""
-        if not title:
-            continue
+    while remaining > 0:
+        page_size = min(_CORE_PAGE_SIZE, remaining)
+        try:
+            resp = requests.get(
+                "https://api.core.ac.uk/v3/search/works/",
+                params={"q": query, "limit": page_size, "offset": offset},
+                headers={"Authorization": f"Bearer {config.CORE_API_KEY}"},
+                timeout=config.REQUEST_TIMEOUT_SECONDS,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("CORE offset=%d failed: %s", offset, exc)
+            break
 
-        authors = [a.get("name") for a in item.get("authors", []) if a.get("name")]
+        results = resp.json().get("results", [])
+        if not results:
+            break
 
-        papers.append(Paper(
-            title=title,
-            authors=authors,
-            year=item.get("yearPublished"),
-            source=config.SOURCE_CORE,
-            doi=item.get("doi"),
-            abstract=item.get("abstract") or "",
-            pdf_url=item.get("downloadUrl") or (item.get("sourceFulltextUrls") or [None])[0],
-        ))
-    return papers
+        for item in results:
+            title = item.get("title") or ""
+            if not title:
+                continue
+
+            authors = [a.get("name") for a in item.get("authors", []) if a.get("name")]
+
+            papers.append(Paper(
+                title=title,
+                authors=authors,
+                year=item.get("yearPublished"),
+                source=config.SOURCE_CORE,
+                doi=item.get("doi"),
+                abstract=item.get("abstract") or "",
+                pdf_url=item.get("downloadUrl") or (item.get("sourceFulltextUrls") or [None])[0],
+                publisher=item.get("publisher") or item.get("publisherName"),
+            ))
+
+        remaining -= len(results)
+        if len(results) < page_size:
+            break  # Last page
+        offset += page_size
+        time.sleep(0.1)
+
+    return papers[:limit]
 
 
 # ------------------------------------------------------------------------
 # Semantic Scholar - https://api.semanticscholar.org  (key optional, raises
 # rate limits when provided)
+# Semantic Scholar search supports limit up to 100 per request.
+# Paginate via offset to reach target limit.
 # ------------------------------------------------------------------------
+
+_SEMANTIC_SCHOLAR_PAGE_SIZE = 100
+
 
 def fetch_semantic_scholar(query: str, limit: int = config.RESULTS_PER_SOURCE) -> List[Paper]:
     """
-    Fetch papers from Semantic Scholar.
+    Fetch up to `limit` papers from Semantic Scholar, paginating via offset.
     
     NOTE: The API key actually causes MORE aggressive rate limiting when provided,
     so we deliberately omit it. See:
     https://api.semanticscholar.org/graph/v1/paper/search
     """
-    # Small delay to avoid hammering the API
-    time.sleep(0.1)
-    
-    def make_request():
-        return requests.get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={
-                "query": query,
-                "limit": limit,
-                "fields": "title,authors,year,abstract,externalIds,openAccessPdf",
-            },
-            timeout=config.REQUEST_TIMEOUT_SECONDS,
-        )
-    
-    # Retry with exponential backoff for rate limits
-    resp = _retry_with_backoff(make_request)
-    
-    if resp is None:
-        return []
-    
-    resp.raise_for_status()
-    items = resp.json().get("data", [])
+    papers: List[Paper] = []
+    offset = 0
+    remaining = limit
 
-    papers = []
-    for item in items:
-        title = item.get("title") or ""
-        if not title:
-            continue
+    while remaining > 0:
+        page_size = min(_SEMANTIC_SCHOLAR_PAGE_SIZE, remaining)
+        # Small delay to avoid hammering the API
+        time.sleep(0.2)
 
-        authors = [a.get("name") for a in item.get("authors", []) if a.get("name")]
-        external_ids = item.get("externalIds") or {}
-        oa_pdf = item.get("openAccessPdf") or {}
+        def make_request(os=offset, ps=page_size):
+            return requests.get(
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                params={
+                    "query": query,
+                    "limit": ps,
+                    "offset": os,
+                    "fields": "title,authors,year,abstract,externalIds,openAccessPdf",
+                },
+                timeout=config.REQUEST_TIMEOUT_SECONDS,
+            )
 
-        papers.append(Paper(
-            title=title,
-            authors=authors,
-            year=item.get("year"),
-            source=config.SOURCE_SEMANTIC_SCHOLAR,
-            doi=external_ids.get("DOI"),
-            abstract=item.get("abstract") or "",
-            pdf_url=oa_pdf.get("url"),
-        ))
-    return papers
+        # Retry with exponential backoff for rate limits
+        resp = _retry_with_backoff(make_request)
+
+        if resp is None:
+            break
+
+        if resp.status_code != 200:
+            logger.warning("Semantic Scholar returned %d at offset=%d", resp.status_code, offset)
+            break
+
+        data = resp.json()
+        items = data.get("data", [])
+        if not items:
+            break
+
+        for item in items:
+            title = item.get("title") or ""
+            if not title:
+                continue
+
+            authors = [a.get("name") for a in item.get("authors", []) if a.get("name")]
+            external_ids = item.get("externalIds") or {}
+            oa_pdf = item.get("openAccessPdf") or {}
+
+            papers.append(Paper(
+                title=title,
+                authors=authors,
+                year=item.get("year"),
+                source=config.SOURCE_SEMANTIC_SCHOLAR,
+                doi=external_ids.get("DOI"),
+                abstract=item.get("abstract") or "",
+                pdf_url=oa_pdf.get("url"),
+                publisher=item.get("publisher"),
+            ))
+
+        remaining -= len(items)
+        if len(items) < page_size:
+            break  # Reached end of results
+        # Semantic Scholar API returns total count - respect it
+        total = data.get("total", 0)
+        if offset + page_size >= total:
+            break
+        offset += page_size
+
+    return papers[:limit]
 
 
 # ------------------------------------------------------------------------

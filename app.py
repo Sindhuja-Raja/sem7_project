@@ -49,20 +49,32 @@ Pipeline (fully real-time, no database):
 
 import os
 
-# All models this app uses (BAAI/bge-large-en-v1.5, BAAI/bge-small-en-v1.5,
-# cross-encoder/ms-marco-MiniLM-L12-v2) are already fully cached locally.
-# Without this, huggingface_hub still does a HEAD request to huggingface.co
-# on every startup to check for updates - if that host is unreachable/slow,
-# each file retries 5x with exponential backoff (~20s) before falling back
-# to the cache anyway. Forcing offline mode skips the network check
-# entirely and goes straight to the cache. setdefault() so an explicit
-# environment override still wins. Must be set before sentence_transformers/
-# transformers/huggingface_hub are imported anywhere (including
-# transitively, by embedding.py/rerank.py/rag_pipeline.py below), since
-# they read these at import time - hence this sits above every other
-# import in this entry-point file.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# HuggingFace model cache check:
+# Only force offline mode if the primary embedding model is already cached locally.
+# When models are not cached, this allows them to be downloaded from HuggingFace.
+# setdefault() so an explicit environment override (HF_HUB_OFFLINE=1 in .env) wins.
+# Must be evaluated before sentence_transformers/transformers/huggingface_hub are
+# imported anywhere - hence this sits above every other import in this entry-point.
+def _hf_models_are_cached() -> bool:
+    """Returns True if the primary HuggingFace models are already cached locally"""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["python", "-c",
+             "from sentence_transformers import SentenceTransformer; "
+             "SentenceTransformer('BAAI/bge-large-en-v1.5', local_files_only=True); print('ok')"],
+            capture_output=True, text=True, timeout=15
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+if os.environ.get("HF_HUB_OFFLINE", "") not in ("1", "true", "True"):
+    # Only force offline mode if models are actually cached; otherwise allow download
+    if _hf_models_are_cached():
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    # else: allow HuggingFace to download models on first run
 
 import logging
 import re
@@ -78,7 +90,7 @@ import streamlit as st
 import config
 import llm
 from contradiction_detection import (
-    ContradictionReport, classify_pairs, extract_claims, match_claim_pairs,
+    ContradictionReport, classify_pairs, extract_claims, match_claim_pairs, predict_contradiction_pairs,
 )
 from embedding import cluster_texts, embed_texts, rank_by_similarity
 from inventor_agent import GENERAL_BEST_PRACTICE, SUPPORTED_BY_LITERATURE, generate_recommendation
@@ -91,10 +103,18 @@ from rag_pipeline import (
     NOT_FOUND_IN_CONTEXT, PaperIndex, build_paper_index_from_sections, get_chunk_embedding_model,
 )
 from rerank import rerank_papers
-from retrieve import fetch_all_sources
+from retrieve import fetch_all_sources, filter_papers_by_metadata
 from root_cause_analysis import analyze_root_causes
 from utils import Paper, deduplicate_papers
 import ui_theme
+
+try:
+    _hero_metric_row = ui_theme.hero_metric_row
+except AttributeError:
+    import importlib
+
+    ui_theme = importlib.reload(ui_theme)
+    _hero_metric_row = getattr(ui_theme, "hero_metric_row", ui_theme.metric_row)
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +125,12 @@ _TOKEN_SPLIT_RE = re.compile(r",| / |/| and |;")
 def _tokenize(value: str) -> List[str]:
     return [t.strip() for t in _TOKEN_SPLIT_RE.split(value or "") if t.strip() and t.strip().lower() != NOT_FOUND_IN_CONTEXT.lower()]
 
-st.set_page_config(page_title="Research Paper Retrieval System", page_icon="📚", layout="wide")
+st.set_page_config(
+    page_title="Research Paper Retrieval System",
+    page_icon=":material/menu_book:",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 
 @dataclass
@@ -168,7 +193,7 @@ def _collect_valid_papers(candidates: List[Paper], target_count: int, status) ->
     validation_results: List[PaperValidationResult] = []
     rejected_count = 0
     replaced_count = 0
-    batch_size = max(target_count, 5)
+    batch_size = max(target_count, 8)  # process at least 8 per batch to amortize overhead
     idx = 0
     batch_num = 0
 
@@ -185,7 +210,7 @@ def _collect_valid_papers(candidates: List[Paper], target_count: int, status) ->
             f"{len(batch)} paper(s) (batch {batch_num}) - chunking/embedding/FAISS only runs for "
             "papers that pass validation..."
         )
-        with ThreadPoolExecutor(max_workers=min(6, len(batch))) as executor:
+        with ThreadPoolExecutor(max_workers=min(8, len(batch))) as executor:
             batch_outcomes = list(executor.map(_extract_validate_and_index, batch))
 
         batch_valid_count = 0
@@ -218,80 +243,121 @@ def _collect_valid_papers(candidates: List[Paper], target_count: int, status) ->
     )
 
 
-def run_pipeline(query: str, display_n: int) -> None:
+def _generate_paper_ai_fields(paper: Paper, query: str) -> None:
+    """Generates ai_summary and ai_reason for one paper in-place.
+    Designed to run concurrently inside a ThreadPoolExecutor."""
+    paper.ai_summary = llm.summarize_paper(paper.title, paper.abstract)
+    paper.ai_reason = llm.explain_relevance(query, paper.title, paper.abstract)
+
+
+def run_pipeline(
+    query: str, display_n: int, results_per_source: int, top_k: int,
+    year_from: Optional[int] = None, year_to: Optional[int] = None,
+    publishers: Optional[List[str]] = None,
+) -> None:
     """Execute the full retrieve -> dedupe -> rank -> rerank -> explain
-    pipeline for `query` and stash the results in session_state."""
+    pipeline for `query` and stash the results in session_state.
 
-    with st.status("Running AI-powered retrieval pipeline...", expanded=True) as status:
-        status.write("Understanding research intent (LLM Query Understanding Agent)...")
-        qu = understand_query(query)
-        if qu.llm_generated:
+    Args:
+        query:              Raw user query string.
+        display_n:          Number of valid papers to collect and show.
+        results_per_source: Max papers fetched from each API source.
+        top_k:              Candidates kept after embedding, before cross-encoder.
+    """
+    import config as _cfg
+    # Temporarily override pipeline tuning with caller-supplied values
+    _orig_rps = _cfg.RESULTS_PER_SOURCE
+    _orig_topk = _cfg.TOP_K_AFTER_EMBEDDING
+    _cfg.RESULTS_PER_SOURCE = results_per_source
+    _cfg.TOP_K_AFTER_EMBEDDING = top_k
+
+    try:
+        with st.status("Running AI-powered retrieval pipeline...", expanded=True) as status:
+            status.write("Understanding research intent (LLM Query Understanding Agent)...")
+            qu = understand_query(query)
+            if qu.llm_generated:
+                status.write(
+                    f"Domain: **{qu.research_domain}** | Problem: **{qu.research_problem}** | "
+                    f"Primary technique: **{qu.primary_ai_technique}**"
+                )
+                status.write(f"Search intent: *{qu.search_intent}*")
+                status.write(f"Generated boolean query: `{qu.search_query}`")
+            else:
+                status.write("GROQ_API_KEY not set - falling back to the raw title as the search query.")
+
+            source_queries = build_source_queries(qu)
             status.write(
-                f"Domain: **{qu.research_domain}** | Problem: **{qu.research_problem}** | "
-                f"Primary technique: **{qu.primary_ai_technique}**"
+                f"Retrieving up to **{results_per_source}** papers per source from OpenAlex, Crossref, "
+                f"arXiv, CORE and Semantic Scholar in parallel..."
             )
-            status.write(f"Search intent: *{qu.search_intent}*")
-            status.write(f"Generated boolean query: `{qu.search_query}`")
-        else:
-            status.write("GROQ_API_KEY not set - falling back to the raw title as the search query.")
+            raw_papers, source_status = fetch_all_sources(source_queries)
+            status.write(f"Retrieved {len(raw_papers)} raw records. " +
+                         " | ".join(f"{src}: {s}" for src, s in source_status.items()))
 
-        source_queries = build_source_queries(qu)
-        status.write("Retrieving papers from OpenAlex, Crossref, arXiv, CORE and Semantic Scholar in parallel "
-                      "(each source gets a query tuned to how it actually parses search syntax)...")
-        raw_papers, source_status = fetch_all_sources(source_queries)
-        status.write(f"Retrieved {len(raw_papers)} raw records. " +
-                     " | ".join(f"{src}: {s}" for src, s in source_status.items()))
+            status.write("Removing duplicates (DOI, title similarity, authors, year)...")
+            unique_papers = deduplicate_papers(raw_papers)
+            status.write(f"{len(unique_papers)} unique papers after deduplication.")
 
-        status.write("Removing duplicates (DOI, title similarity, authors, year)...")
-        unique_papers = deduplicate_papers(raw_papers)
-        status.write(f"{len(unique_papers)} unique papers after deduplication.")
+            if year_from is not None or year_to is not None or publishers:
+                status.write("Applying metadata filters (year range / publisher)...")
+                unique_papers = filter_papers_by_metadata(unique_papers, year_from, year_to, publishers)
+                status.write(f"{len(unique_papers)} papers remain after metadata filtering.")
 
-        status.write("Computing dense semantic similarity (BAAI/bge-large-en-v1.5)...")
-        similarity_ranked = rank_by_similarity(query, unique_papers)
-        shortlist = similarity_ranked[: config.TOP_K_AFTER_EMBEDDING]
+            status.write(f"Computing dense semantic similarity — keeping top {top_k} candidates...")
+            similarity_ranked = rank_by_similarity(query, unique_papers)
+            shortlist = similarity_ranked[:top_k]
 
-        status.write("Re-ranking shortlist with cross-encoder/ms-marco-MiniLM-L12-v2...")
-        reranked = rerank_papers(query, shortlist)
+            status.write(f"Re-ranking {len(shortlist)} candidates with cross-encoder...")
+            reranked = rerank_papers(query, shortlist)
 
-        status.write(
-            f"Collecting {display_n} VALID papers (PDF readable, minimum word count, meaningful "
-            f"content - a missing section never disqualifies a paper) from {len(reranked)} ranked "
-            f"candidates - a paper that fails validation is discarded and automatically replaced by "
-            f"the next-ranked candidate..."
-        )
-        collection = _collect_valid_papers(reranked, display_n, status)
-        top_papers = collection.valid_papers
-        rag_cache = collection.rag_cache
-        validation_results = collection.validation_results
-        valid_papers = top_papers  # every downstream module already reads `valid_papers`;
-                                    # by construction `top_papers` is now always fully valid
-        total_chunks = sum(len(idx.chunks) for idx in rag_cache.values())
-        status.write(
-            f"Papers retrieved: {collection.retrieved_count} | rejected: {collection.rejected_count} | "
-            f"replaced: {collection.replaced_count} | final valid papers: {len(top_papers)}. "
-            f"Indexed {total_chunks} chunks across {len(rag_cache)} papers."
-        )
+            status.write(
+                f"Collecting {display_n} VALID papers from {len(reranked)} ranked candidates — "
+                f"invalid papers are auto-replaced by the next-ranked candidate..."
+            )
+            collection = _collect_valid_papers(reranked, display_n, status)
+            top_papers = collection.valid_papers
+            rag_cache = collection.rag_cache
+            validation_results = collection.validation_results
+            valid_papers = top_papers
+            total_chunks = sum(len(idx.chunks) for idx in rag_cache.values())
+            status.write(
+                f"Papers retrieved: {collection.retrieved_count} | rejected: {collection.rejected_count} | "
+                f"replaced: {collection.replaced_count} | final valid papers: {len(top_papers)}. "
+                f"Indexed {total_chunks} chunks across {len(rag_cache)} papers."
+            )
 
-        if llm.is_available():
-            status.write(f"Generating AI summaries and relevance explanations for the {len(top_papers)} valid papers...")
-        else:
-            status.write("GROQ_API_KEY not set - showing results without AI summaries/explanations.")
+            # ── Parallel AI summaries + relevance explanations ─────────────
+            if llm.is_available():
+                if top_papers:
+                    status.write(
+                        f"Generating AI summaries and relevance explanations for {len(top_papers)} papers "
+                        f"(parallel Groq calls)..."
+                    )
+                    _llm_workers = min(4, len(top_papers))  # max 4 concurrent Groq calls
+                    with ThreadPoolExecutor(max_workers=_llm_workers) as _ex:
+                        list(_ex.map(lambda p: _generate_paper_ai_fields(p, query), top_papers))
+                else:
+                    status.write("No papers remain after filtering, so AI summaries and relevance explanations are skipped.")
+            else:
+                status.write("GROQ_API_KEY not set - showing results without AI summaries/explanations.")
+                for paper in top_papers:
+                    paper.ai_summary = llm.summarize_paper(paper.title, paper.abstract)
+                    paper.ai_reason = llm.explain_relevance(query, paper.title, paper.abstract)
 
-        for paper in top_papers:
-            paper.ai_summary = llm.summarize_paper(paper.title, paper.abstract)
-            paper.ai_reason = llm.explain_relevance(query, paper.title, paper.abstract)
+            status.write("Running knowledge extraction (AI model, dataset, gaps, future work) "
+                          "across VALID results only, from RAG-retrieved chunks only...")
+            knowledge = analyze_papers(valid_papers, rag_cache, max_papers=display_n)
 
-        status.write("Running knowledge extraction (AI model, dataset, gaps, future work) across "
-                      "VALID results only, from RAG-retrieved chunks only...")
-        knowledge = analyze_papers(valid_papers, rag_cache)
+            status.write("Running Problem-Solution Analysis across all VALID results...")
+            problem_solution = analyze_problems_and_solutions(
+                valid_papers, knowledge.knowledge_table, knowledge.overall_analysis, rag_cache,
+            )
 
-        status.write("Running Problem-Solution Analysis (synthesizing common research problems "
-                      "and their proposed solutions across all VALID results)...")
-        problem_solution = analyze_problems_and_solutions(
-            valid_papers, knowledge.knowledge_table, knowledge.overall_analysis, rag_cache,
-        )
-
-        status.update(label="Done.", state="complete", expanded=False)
+            status.update(label="Done.", state="complete", expanded=False)
+    finally:
+        # Always restore original config values
+        _cfg.RESULTS_PER_SOURCE = _orig_rps
+        _cfg.TOP_K_AFTER_EMBEDDING = _orig_topk
 
     st.session_state.results = top_papers
     st.session_state.valid_papers = valid_papers
@@ -321,33 +387,53 @@ def run_pipeline(query: str, display_n: int) -> None:
 
 def render_paper(rank: int, paper: Paper, validation_status: Optional[str] = None) -> None:
     with st.container(border=True):
-        header_cols = st.columns([5, 2])
-        header_cols[0].markdown(f"### {rank}. {paper.title}")
+        # ── Title row ──────────────────────────────────────────────────────
+        header_cols = st.columns([6, 1], vertical_alignment="center")
+        header_cols[0].markdown(f"#### {rank}. {paper.title}")
         if validation_status == VALID:
-            header_cols[1].markdown(ui_theme.chip("✅ VALID", "#22c55e"), unsafe_allow_html=True)
+            header_cols[1].markdown(
+                ui_theme.chip("✓ Valid", "#22c55e"), unsafe_allow_html=True,
+            )
         elif validation_status == INVALID:
             header_cols[1].markdown(
-                ui_theme.chip("❌ INVALID - excluded from analysis", "#ef4444"), unsafe_allow_html=True,
+                ui_theme.chip("✗ Invalid", "#ef4444"), unsafe_allow_html=True,
             )
 
-        meta_cols = st.columns(4)
-        meta_cols[0].markdown(f"**Authors**\n\n{paper.authors_display()}")
-        meta_cols[1].markdown(f"**Year**\n\n{paper.year or 'Unknown'}")
-        meta_cols[2].markdown(f"**Source**\n\n{paper.source}")
-        meta_cols[3].markdown(f"**DOI**\n\n{paper.doi or 'N/A'}")
+        # ── Metadata chips ─────────────────────────────────────────────────
+        meta_parts = []
+        if paper.authors_display():
+            meta_parts.append(f":material/person: {paper.authors_display()}")
+        if paper.year:
+            meta_parts.append(f":material/calendar_today: {paper.year}")
+        meta_parts.append(f":material/database: {paper.source}")
+        if paper.doi:
+            meta_parts.append(f":material/link: {paper.doi}")
+        st.caption("  ·  ".join(meta_parts))
 
+        # ── Score bar ──────────────────────────────────────────────────────
         score_cols = st.columns(2)
-        score_cols[0].metric("Semantic Similarity Score", f"{paper.similarity_score:.3f}")
-        score_cols[1].metric("AI Relevance (Cross-Encoder) Score", f"{paper.rerank_score:.3f}")
+        score_cols[0].metric(
+            ":material/analytics: Semantic similarity", f"{paper.similarity_score:.3f}",
+        )
+        score_cols[1].metric(
+            ":material/psychology: Cross-encoder relevance", f"{paper.rerank_score:.3f}",
+        )
 
-        with st.expander("Abstract", expanded=False):
+        # ── Abstract ───────────────────────────────────────────────────────
+        with st.expander(":material/article: Abstract", expanded=False):
             st.write(paper.abstract or "No abstract available.")
 
-        st.markdown(f"**AI Summary**\n\n{paper.ai_summary}")
-        st.markdown(f"**Why this paper is relevant**\n\n{paper.ai_reason}")
+        # ── AI insights ────────────────────────────────────────────────────
+        if paper.ai_summary and paper.ai_summary != "N/A":
+            st.markdown(f"**:material/auto_awesome: AI summary** · {paper.ai_summary}")
+        if paper.ai_reason and paper.ai_reason != "N/A":
+            st.markdown(f"**:material/lightbulb: Why relevant** · {paper.ai_reason}")
 
+        # ── PDF link ───────────────────────────────────────────────────────
         if paper.pdf_url:
-            st.link_button("Open PDF / Source", paper.pdf_url)
+            st.link_button(
+                ":material/open_in_new: Open PDF / source", paper.pdf_url,
+            )
         else:
             st.caption("No PDF link available from the source API.")
 
@@ -396,67 +482,178 @@ def render_validation_tab(validation_results: List) -> None:
 def render_overview_strip(
     query: str, results: List[Paper], knowledge, problem_solution, rag_cache: dict,
 ) -> None:
-    """Always-visible "home page" summary above the tabs: what was
-    searched, how many papers, RAG index size, and which agents have run
-    so far - all derived from state the pipeline already populates, no new
-    tracking added."""
+    """Always-visible summary banner above the tabs."""
     total_chunks = sum(len(idx.chunks) for idx in (rag_cache or {}).values())
-    with st.container(border=True):
-        st.markdown(f"**Research Topic:** {query or 'Unknown'}")
+    st.markdown(
+        f"""
+        <div class="rs-hero">
+            <p style="margin:0 0 14px 0;font-size:0.82rem;opacity:0.65;text-transform:uppercase;
+                letter-spacing:0.07em;">
+                :material/search: Search query
+            </p>
+            <p style="margin:0 0 18px 0;font-size:1.1rem;font-weight:600;">{query or '—'}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    _hero_metric_row([
+        ("Papers found", st.session_state.get("total_unique", len(results))),
+        ("Papers displayed", len(results)),
+        ("Chunks indexed", total_chunks),
+        ("LLM", "✓ Online" if llm.is_available() else "✗ Off"),
+    ])
+    stats = st.session_state.get("paper_collection_stats")
+    if stats:
+        st.caption("Validation backfill — invalid papers auto-replaced by next-ranked candidate")
         ui_theme.metric_row([
-            ("Papers Found", st.session_state.get("total_unique", len(results))),
-            ("Papers Displayed", len(results)),
-            ("Chunks Indexed", total_chunks),
-            ("LLM", "Configured" if llm.is_available() else "Not configured"),
+            ("Retrieved", stats["retrieved"]),
+            ("Rejected", stats["rejected"]),
+            ("Replaced", stats["replaced"]),
+            ("Final valid", f"{stats['final_valid']} / {stats['target']}"),
         ])
-        stats = st.session_state.get("paper_collection_stats")
-        if stats:
-            st.caption("Paper Validation Backfill (invalid papers auto-replaced by the next-ranked candidate)")
-            ui_theme.metric_row([
-                ("Papers Retrieved", stats["retrieved"]),
-                ("Papers Rejected", stats["rejected"]),
-                ("Papers Replaced", stats["replaced"]),
-                ("Final Valid Papers Used", f"{stats['final_valid']} / {stats['target']}"),
-            ])
-        st.caption("Agent Status")
-        ui_theme.agent_status_row([
-            ("Retrieval & Ranking", bool(results)),
-            ("RAG Index", bool(rag_cache)),
-            ("Paper Validation", st.session_state.get("paper_validation_results") is not None),
-            ("Knowledge Extraction", bool(knowledge and knowledge.knowledge_table)),
-            ("Problem-Solution", bool(problem_solution and problem_solution.problem_solution_table)),
-            ("Contradiction Detection", st.session_state.get("contradiction_report") is not None),
-            ("Inventor Agent", st.session_state.get("inventor_recommendation") is not None),
-        ])
+    st.caption("Agent pipeline status")
+    ui_theme.agent_status_row([
+        ("Retrieval & ranking", bool(results)),
+        ("RAG index", bool(rag_cache)),
+        ("Paper validation", st.session_state.get("paper_validation_results") is not None),
+        ("Knowledge extraction", bool(knowledge and knowledge.knowledge_table)),
+        ("Problem-solution", bool(problem_solution and problem_solution.problem_solution_table)),
+        ("Contradiction detection", st.session_state.get("contradiction_report") is not None),
+        ("Inventor agent", st.session_state.get("inventor_recommendation") is not None),
+    ])
 
 
 def main() -> None:
     ui_theme.inject_css()
-    st.title("Research Paper Retrieval System")
-    st.caption(
-        "Real-time, database-free retrieval from OpenAlex, Crossref, arXiv, CORE"
+
+    # ── Hero banner ────────────────────────────────────────────────────────
+    st.markdown(
+        """
+        <div style="
+            background: linear-gradient(135deg, rgba(99,102,241,0.18) 0%, rgba(14,165,233,0.12) 100%);
+            border: 1px solid rgba(99,102,241,0.30);
+            border-radius: 16px;
+            padding: 28px 32px 22px 32px;
+            margin-bottom: 24px;
+            position: relative;
+            overflow: hidden;
+        ">
+            <div style="position:absolute;top:0;left:0;right:0;height:3px;
+                background:linear-gradient(90deg,#6366f1,#0ea5e9,#14b8a6);
+                border-radius:16px 16px 0 0;"></div>
+            <h1 style="margin:0 0 6px 0;font-size:2rem;font-weight:800;
+                background:linear-gradient(90deg,#a5b4fc,#7dd3fc);
+                -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
+                :material/menu_book: Research Paper Retrieval System
+            </h1>
+            <p style="margin:0;font-size:0.92rem;opacity:0.72;max-width:820px;">
+                Real-time, database-free retrieval from OpenAlex, Crossref, arXiv, CORE"""
         + (" and Semantic Scholar" if config.ENABLE_SEMANTIC_SCHOLAR else "")
-        + " - ranked with dense embeddings, cross-encoder re-ranking and LLM explanations."
+        + """ — ranked with dense embeddings, cross-encoder re-ranking and LLM explanations.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
+    # ── Sidebar ────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("Settings")
-        display_n = st.slider("Number of papers to display", min_value=5, max_value=15, value=10)
+        st.markdown("### :material/tune: Settings")
 
-        st.header("AI / API status")
-        st.markdown(f"- LLM (Groq, `{config.GROQ_MODEL}`): {'✅ configured' if llm.is_available() else '⚠️ no GROQ_API_KEY - summaries/explanations disabled'}")
-        st.markdown(f"- CORE API: {'✅ configured' if config.CORE_API_KEY else '⚠️ no key - source skipped'}")
-        if config.ENABLE_SEMANTIC_SCHOLAR:
-            st.markdown(f"- Semantic Scholar API: {'✅ key configured' if config.SEMANTIC_SCHOLAR_API_KEY else 'ℹ️ no key - using public rate limit'}")
+        speed_mode = st.radio(
+            "Speed mode",
+            options=["⚡ Fast", "⚖️ Balanced", "🔬 Deep"],
+            index=1,
+            help=(
+                "**⚡ Fast** — 50 papers/source, top-50 re-ranked. Best for quick exploration.\n\n"
+                "**⚖️ Balanced** — 100 papers/source, top-150 re-ranked. Good quality + speed.\n\n"
+                "**🔬 Deep** — 200 papers/source, top-500 re-ranked. Maximum coverage (slowest)."
+            ),
+        )
+        _speed_config = {
+            "⚡ Fast":     {"rps": 50,  "topk": 300},
+            "⚖️ Balanced": {"rps": 100, "topk": 400},
+            "🔬 Deep":     {"rps": 200, "topk": 600},
+        }[speed_mode]
+        results_per_source = _speed_config["rps"]
+        top_k_rerank      = _speed_config["topk"]
+
+        display_n = st.slider(
+            "Papers to display",
+            min_value=5,
+            max_value=50,
+            value=10,
+            help=(
+                "How many valid papers to collect and display. "
+                "Lower = faster (fewer PDFs downloaded and fewer Groq calls). "
+                f"Current mode fetches up to {results_per_source} papers/source."
+            ),
+        )
+
+        st.caption(
+            f"Mode: **{speed_mode}** · {results_per_source} papers/source · "
+            f"top-{top_k_rerank} re-ranked · {display_n} displayed"
+        )
+
+        year_from = st.number_input("Published from year", min_value=1900, max_value=2100, value=None, format="%d")
+        year_to = st.number_input("Published to year", min_value=1900, max_value=2100, value=None, format="%d")
+        publisher_filter = st.text_input(
+            "Publisher filter",
+            placeholder="e.g. IEEE, Springer",
+            help="Optional publisher filter to reduce retrieval noise and speed up downstream processing.",
+        )
+        publisher_values = [p.strip() for p in publisher_filter.split(",") if p.strip()]
+
+        st.markdown("### :material/sensors: API status")
+        # LLM
+        if llm.is_available():
+            st.success(f"Groq LLM · `{config.GROQ_MODEL}`", icon=":material/check_circle:")
         else:
-            st.markdown("- Semantic Scholar API: 🚫 disabled (`ENABLE_SEMANTIC_SCHOLAR=false`) - was hitting persistent rate limits")
-        st.caption("OpenAlex, Crossref and arXiv require no API key.")
+            st.info(
+                "Groq LLM · not configured — AI summaries, knowledge extraction, "
+                "and all analysis features are disabled.  \n"
+                "**[Get free key →](https://console.groq.com/keys)**  \n"
+                "Add `GROQ_API_KEY=your_key` to `.env`",
+                icon=":material/info:",
+            )
+        # CORE
+        if config.CORE_API_KEY:
+            st.success("CORE API · configured", icon=":material/check_circle:")
+        else:
+            st.info(
+                "CORE API · not configured, this source is skipped.  \n"
+                "**[Get free key →](https://core.ac.uk/services/api)**",
+                icon=":material/info:",
+            )
+        # Semantic Scholar
+        if config.ENABLE_SEMANTIC_SCHOLAR:
+            if config.SEMANTIC_SCHOLAR_API_KEY:
+                st.success("Semantic Scholar · key set", icon=":material/check_circle:")
+            else:
+                st.info(
+                    "Semantic Scholar · public rate limit (works, but may be slow).  \n"
+                    "**[Request API key →](https://www.semanticscholar.org/product/api)**",
+                    icon=":material/info:",
+                )
+        else:
+            st.caption("Semantic Scholar disabled (rate-limit issues)")
+        st.success("OpenAlex · no key needed", icon=":material/check_circle:")
+        st.success("Crossref · no key needed", icon=":material/check_circle:")
+        st.success("arXiv · no key needed", icon=":material/check_circle:")
 
-    query = st.text_input(
-        "Enter Research Title",
-        placeholder='e.g. "Agentic AI for Cloud Resource Allocation"',
-    )
-    search_clicked = st.button("Search", type="primary")
+
+    # ── Search bar ─────────────────────────────────────────────────────────
+    search_col, btn_col = st.columns([5, 1], vertical_alignment="bottom")
+    with search_col:
+        query = st.text_input(
+            "Research topic or title",
+            placeholder='e.g. "Agentic AI for Cloud Resource Allocation"',
+            label_visibility="collapsed",
+        )
+    with btn_col:
+        search_clicked = st.button(
+            ":material/search: Search", type="primary", width="stretch",
+        )
 
     if "results" not in st.session_state:
         st.session_state.results = None
@@ -465,17 +662,25 @@ def main() -> None:
         if not query.strip():
             st.warning("Please enter a research paper title or topic.")
         else:
-            run_pipeline(query.strip(), display_n)
+            run_pipeline(
+                query.strip(), display_n, results_per_source, top_k_rerank,
+                year_from=int(year_from) if year_from not in (None, "") else None,
+                year_to=int(year_to) if year_to not in (None, "") else None,
+                publishers=publisher_values,
+            )
 
     qu = st.session_state.get("query_understanding")
     if qu is not None:
-        with st.expander("Query Understanding (extracted research intent)", expanded=False):
+        with st.expander(":material/manage_search: Query understanding (extracted research intent)", expanded=False):
             st.json(qu.to_dict())
 
     results: List[Paper] = st.session_state.results
     if results is not None:
         if not results:
-            st.info("No papers found. Try a broader or differently phrased query.")
+            st.info(
+                "No papers found for this query. Try a broader topic or different phrasing.",
+                icon=":material/search_off:",
+            )
         else:
             knowledge = st.session_state.get("knowledge_analysis")
             problem_solution = st.session_state.get("problem_solution_analysis")
@@ -491,15 +696,23 @@ def main() -> None:
                 tab_papers, tab_validation, tab_overview, tab_knowledge, tab_problem_solution,
                 tab_contradictions, tab_root_cause, tab_ideas, tab_risk, tab_proposal,
             ) = st.tabs([
-                "📄 Papers", "✅ Validation", "📊 Overview & Analytics", "🧠 Knowledge Extraction",
-                "🧩 Problem ↔ Solution", "⚖️ Contradictions", "🔎 Root Cause",
-                "💡 Ideas & Recommendations", "⚠️ Risk Indicators", "📝 Proposal Preview",
+                ":material/article: Papers",
+                ":material/verified: Validation",
+                ":material/analytics: Overview",
+                ":material/psychology: Knowledge",
+                ":material/join_inner: Problems & Solutions",
+                ":material/balance: Contradictions",
+                ":material/troubleshoot: Root cause",
+                ":material/lightbulb: Ideas",
+                ":material/warning: Risk indicators",
+                ":material/description: Proposal",
             ])
 
             with tab_papers:
-                st.subheader(
-                    f"Top {len(results)} results "
-                    f"(of {st.session_state.get('total_unique', len(results))} unique papers found)"
+                st.caption(
+                    f"Showing **{len(results)}** of "
+                    f"{st.session_state.get('total_unique', len(results))} unique papers found — "
+                    f"ranked by semantic similarity then cross-encoder relevance."
                 )
                 status_by_title = {r.paper_title: r.status for r in validation_results}
                 for i, paper in enumerate(results, start=1):
@@ -538,7 +751,7 @@ def render_table(title: str, rows: List[dict]) -> None:
     if not rows:
         st.info("No data extracted for this table.")
         return
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch")
 
 
 def render_overall_analysis(rows: List[dict]) -> None:
@@ -736,7 +949,7 @@ def render_overview_analytics_tab(knowledge, papers: List[Paper]) -> None:
 
     landscape = _technology_landscape_treemap(rows)
     if landscape:
-        st.plotly_chart(landscape, use_container_width=True)
+        st.plotly_chart(landscape, width="stretch")
     else:
         st.info("No technology data was extracted across the analyzed papers.")
 
@@ -753,7 +966,7 @@ def render_overview_analytics_tab(knowledge, papers: List[Paper]) -> None:
                 fig = ui_theme.plotly_bar_ranking(
                     [i["Value"] for i in items], [i["Count"] for i in items], title=label, height=280,
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.caption(f"No {label} data extracted.")
 
@@ -766,7 +979,7 @@ def render_overview_analytics_tab(knowledge, papers: List[Paper]) -> None:
                 [i["Value"] for i in domain_items], [i["Count"] for i in domain_items],
                 title="Research Domain Distribution", height=320,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.caption("No Research Domain data extracted.")
     with accuracy_col:
@@ -779,11 +992,11 @@ def render_overview_analytics_tab(knowledge, papers: List[Paper]) -> None:
 
     coverage_fig = _coverage_heatmap(knowledge.knowledge_table)
     if coverage_fig:
-        st.plotly_chart(coverage_fig, use_container_width=True)
+        st.plotly_chart(coverage_fig, width="stretch")
 
     trend_fig = _trend_timeline(knowledge.knowledge_table)
     if trend_fig:
-        st.plotly_chart(trend_fig, use_container_width=True)
+        st.plotly_chart(trend_fig, width="stretch")
 
     with st.expander("🔤 Keyword Cloud"):
         cloud_cols = st.columns(3)
@@ -806,14 +1019,14 @@ def render_overview_analytics_tab(knowledge, papers: List[Paper]) -> None:
     st.markdown("**Paper Similarity Network**")
     similarity_fig = _paper_similarity_network_figure(papers)
     if similarity_fig:
-        st.plotly_chart(similarity_fig, use_container_width=True)
+        st.plotly_chart(similarity_fig, width="stretch")
     else:
         st.caption("No paper pairs are similar enough to draw an edge.")
 
     st.markdown("**Topic Clusters**")
     clusters_fig = _topic_clusters_figure(papers)
     if clusters_fig:
-        st.plotly_chart(clusters_fig, use_container_width=True)
+        st.plotly_chart(clusters_fig, width="stretch")
 
     render_table("Research Gap Analysis", knowledge.research_gap_analysis)
     render_table("Future Work Analysis", knowledge.future_work_analysis)
@@ -928,7 +1141,7 @@ def render_knowledge_extraction_tab(knowledge) -> None:
             paper_chunks = chunks_by_paper.get(paper_title, [])
             with st.expander(f"Show retrieved evidence ({len(paper_chunks)} chunks)"):
                 if paper_chunks:
-                    st.dataframe(pd.DataFrame(paper_chunks), use_container_width=True)
+                    st.dataframe(pd.DataFrame(paper_chunks), width="stretch")
                 else:
                     st.caption("No chunks retrieved for this paper.")
 
@@ -961,7 +1174,7 @@ def render_problem_solution_analysis(analysis) -> None:
         [row["Research Problem"] for row in table], [row["Frequency"] for row in table],
         title="Research Problems by Frequency", height=max(320, 40 * len(table) + 60),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     for row in table:
         freq = row["Frequency"]
@@ -1158,6 +1371,8 @@ def render_contradiction_detection(papers: List[Paper]) -> None:
                 matched_pairs = match_claim_pairs(claims_by_paper)
                 status.write(f"{len(matched_pairs)} claim pairs discuss the same topic and will be compared.")
 
+                status.write("Generating a lightweight contradiction-risk prediction for each matched pair...")
+                predictions = predict_contradiction_pairs(matched_pairs)
                 status.write("Classifying each matched pair (Agreement / Contradiction / "
                               "Partial Contradiction / Different Context / Insufficient Evidence)...")
                 comparisons = classify_pairs(matched_pairs)
@@ -1175,7 +1390,9 @@ def render_contradiction_detection(papers: List[Paper]) -> None:
                 status.update(label="Done.", state="complete", expanded=False)
 
             st.session_state.contradiction_report = ContradictionReport(
-                comparisons=comparisons, claims_extracted=total_claims,
+                comparisons=comparisons,
+                claims_extracted=total_claims,
+                predictions=predictions,
             )
             st.session_state.contradiction_root_causes = root_causes
 
@@ -1209,23 +1426,23 @@ def render_contradiction_detection(papers: List[Paper]) -> None:
         st.markdown("**Conflict Matrix**")
         matrix_fig = _conflict_matrix_figure(table)
         if matrix_fig:
-            st.plotly_chart(matrix_fig, use_container_width=True)
+            st.plotly_chart(matrix_fig, width="stretch")
         else:
             st.caption("Need at least 2 distinct papers in the comparisons to draw a matrix.")
 
         st.markdown("**Contradiction Flow**")
         sankey_fig = _contradiction_sankey_figure(table)
         if sankey_fig:
-            st.plotly_chart(sankey_fig, use_container_width=True)
+            st.plotly_chart(sankey_fig, width="stretch")
 
         st.markdown("**Evidence Tree**")
         _render_evidence_tree(report.comparisons)
 
         with st.expander("Show as tables (Comparison Table / Contradiction Details)"):
-            st.dataframe(pd.DataFrame(table), use_container_width=True)
+            st.dataframe(pd.DataFrame(table), width="stretch")
             details = report.contradiction_details()
             if details:
-                st.dataframe(pd.DataFrame(details), use_container_width=True)
+                st.dataframe(pd.DataFrame(details), width="stretch")
 
 
 def _evidence_badge_html(supporting_papers: str) -> str:
@@ -1487,26 +1704,26 @@ def render_root_cause_tab() -> None:
                 confidence = rc.confidence or 0
                 st.plotly_chart(
                     ui_theme.plotly_gauge(confidence, title="Confidence", color=_confidence_color(confidence), height=140),
-                    use_container_width=True,
+                    width="stretch",
                 )
             st.plotly_chart(
                 _fishbone_figure(
                     _short_paper_label(c.paper_a), _short_paper_label(c.paper_b), c.topic,
                     rc.root_cause_category, rc.evidence_a, rc.evidence_b,
                 ),
-                use_container_width=True,
+                width="stretch",
             )
             st.caption(rc.root_cause_explanation)
 
     st.markdown("**Root Cause Network**")
     network_fig = _root_cause_network_figure(flagged_pairs)
     if network_fig:
-        st.plotly_chart(network_fig, use_container_width=True)
+        st.plotly_chart(network_fig, width="stretch")
 
     st.markdown("**Root Cause Frequency vs Confidence**")
     bubble_fig = _root_cause_bubble_figure(flagged_pairs)
     if bubble_fig:
-        st.plotly_chart(bubble_fig, use_container_width=True)
+        st.plotly_chart(bubble_fig, width="stretch")
 
 
 def _field_coverage_gap_pct(knowledge_table: List[dict]) -> Optional[float]:
@@ -1592,7 +1809,7 @@ def render_risk_indicators_tab() -> None:
     fig = ui_theme.plotly_radar(
         axes, values, title="Risk Indicators (higher = more risk)", color=ui_theme.CATEGORY_PALETTE[4],
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.caption(
         "Computed directly from retrieval/analysis coverage (field coverage gaps, evidence-source "
         "reliability, contradiction rate, root-cause confidence) - not a machine-learned failure "

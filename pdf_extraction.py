@@ -329,7 +329,7 @@ def paper_id_for(paper: Paper) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
-def _sections_to_document(sections: Dict[str, str]) -> str:
+def _sections_to_document(sections: Dict[str, str]) -> str: 
     """Serializes a sections dict back into a flat document whose headings
     round-trip through _split_into_sections() unchanged, so a cached file
     can be reloaded with the exact same parser used for a fresh PDF - no
@@ -366,6 +366,19 @@ def _print_extraction_summary(title: str, full_text: str) -> None:
     _safe_print(f"  First 1000 characters:\n{full_text[:1000]}")
 
 
+def _abstract_fallback(paper: Paper) -> Dict[str, str]:
+    """Returns the paper's abstract as a minimal {section: text} dict when
+    the full PDF is unavailable. Allows papers without PDFs to still pass
+    validation and contribute to AI analysis via their abstract text."""
+    abstract = getattr(paper, "abstract", None) or ""
+    abstract = abstract.strip()
+    if abstract:
+        logger.info("Using abstract fallback for '%s' (no PDF available).", paper.title[:60])
+        return {"Abstract": abstract}
+    logger.info("No abstract and no PDF for '%s' - will be rejected.", paper.title[:60])
+    return {}
+
+
 def get_full_paper_text(paper: Paper) -> Dict[str, str]:
     """Returns {section_name: cleaned_text} for the paper's COMPLETE PDF
     content - the only function callers should use to get a paper's full
@@ -376,22 +389,16 @@ def get_full_paper_text(paper: Paper) -> Dict[str, str]:
     miss, downloads and parses the PDF, cleans every section, prints the
     verification summary, and writes the cache file before returning.
 
-    Returns {} - never raises - if there's no pdf_url, the download/parse
-    fails, or the PDF has no usable text; the failure is logged as an
-    ERROR ("marked FAILED") and the caller (app.py's
-    _extract_validate_and_index) passes the empty result straight to
-    paper_validation.validate_paper_text(), which rejects it before any
-    chunking/embedding/FAISS work ever runs. One paper's failure here
-    never stops the rest of the batch - app.py calls this per-paper
-    inside its own try/except."""
-    if not paper.pdf_url:
-        logger.info("No pdf_url for %s - will fall back to abstract.", paper.title[:60])
-        return {}
-
+    Falls back to the paper's abstract when there is no pdf_url, the
+    download fails, or the PDF yields no usable text — so papers without
+    PDFs still pass validation and contribute to AI analysis via their
+    abstract. Returns {} (never raises) only when both the PDF AND the
+    abstract are unavailable."""
     paper_id = paper_id_for(paper)
     PAPERS_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = PAPERS_DIR / f"{paper_id}.txt"
 
+    # ── 1. Disk cache hit ────────────────────────────────────────────────
     if cache_path.exists():
         cached_document = cache_path.read_text(encoding="utf-8", errors="ignore")
         sections = _split_into_sections(cached_document)
@@ -400,21 +407,32 @@ def get_full_paper_text(paper: Paper) -> Dict[str, str]:
             full_text = "\n\n".join(sections.values())
             _print_extraction_summary(f"{paper.title} (cached)", full_text)
             return sections
-        # Cache file existed but somehow parsed empty - fall through and
-        # re-fetch rather than permanently returning nothing for this paper.
         logger.warning("Cached text for %s was empty/unparsable - re-fetching.", paper.title[:60])
 
+    # ── 2. No PDF URL → abstract fallback ───────────────────────────────
+    if not paper.pdf_url:
+        fallback = _abstract_fallback(paper)
+        if fallback:
+            try:
+                cache_path.write_text(
+                    _sections_to_document(fallback), encoding="utf-8"
+                )
+            except OSError:
+                pass
+        return fallback
+
+    # ── 3. Download & parse PDF ──────────────────────────────────────────
     try:
         raw_sections = fetch_pdf_sections(paper.pdf_url)
     except Exception as exc:  # noqa: BLE001 - PDF issues must never break indexing
-        logger.error("PDF extraction FAILED for %s: %s", paper.title[:60], exc)
-        return {}
+        logger.error("PDF extraction FAILED for %s: %s — trying abstract fallback.", paper.title[:60], exc)
+        return _abstract_fallback(paper)
 
     sections = {name: clean_text(text) for name, text in raw_sections.items() if text}
     sections = {name: text for name, text in sections.items() if text}
     if not sections:
-        logger.error("PDF extraction FAILED for %s: no usable text after cleaning.", paper.title[:60])
-        return {}
+        logger.error("PDF extraction FAILED for %s: no usable text after cleaning — trying abstract fallback.", paper.title[:60])
+        return _abstract_fallback(paper)
 
     full_text = "\n\n".join(sections.values())
     _print_extraction_summary(paper.title, full_text)
@@ -425,3 +443,4 @@ def get_full_paper_text(paper: Paper) -> Dict[str, str]:
         logger.warning("Could not write PDF text cache for %s: %s", paper.title[:60], exc)
 
     return sections
+

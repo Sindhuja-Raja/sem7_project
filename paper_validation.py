@@ -38,8 +38,10 @@ validity.
 
 A paper that fails any check is rejected before any chunking/embedding/
 FAISS-indexing work ever runs for it; a paper that passes proceeds
-unchanged to rag_pipeline.build_paper_index_from_sections(). One paper's
-validation failure never stops the rest from being validated.
+unchanged to rag_pipeline.build_paper_index_from_sections(). Abstract-only
+fallbacks are allowed through a smaller threshold so papers without a
+full PDF can still be shown. One paper's validation failure never stops
+the rest from being validated.
 """
 
 import logging
@@ -85,6 +87,26 @@ def _validate_text(paper: Paper, sections: Dict[str, str]) -> PaperValidationRes
     unique_word_count = len({
         word.lower() for text in sections.values() for word in text.split() if word.isalpha()
     })
+
+    abstract_only = set(sections_found) == {"Abstract"}
+    if abstract_only:
+        reasons: List[str] = []
+        if word_count < config.PAPER_VALIDATION_MIN_ABSTRACT_WORDS:
+            reasons.append(
+                f"Abstract-only fallback is only {word_count} words (minimum {config.PAPER_VALIDATION_MIN_ABSTRACT_WORDS} required)."
+            )
+        if unique_word_count < config.PAPER_VALIDATION_MIN_ABSTRACT_UNIQUE_WORDS:
+            reasons.append(
+                f"Abstract-only fallback has only {unique_word_count} distinct words - looks degenerate or truncated."
+            )
+
+        return PaperValidationResult(
+            paper_title=paper.title,
+            status=INVALID if reasons else VALID,
+            reasons=reasons,
+            word_count=word_count,
+            sections_found=sections_found,
+        )
 
     reasons: List[str] = []
     if word_count < config.PAPER_VALIDATION_MIN_WORDS:

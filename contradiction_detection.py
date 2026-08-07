@@ -38,6 +38,7 @@ Workflow:
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
@@ -82,9 +83,10 @@ class ClaimComparison:
 class ContradictionReport:
     comparisons: List[ClaimComparison] = field(default_factory=list)
     claims_extracted: int = 0
+    predictions: List[dict] = field(default_factory=list)
 
     def comparison_table(self) -> List[dict]:
-        return [
+        rows = [
             {
                 "Paper A": c.paper_a,
                 "Paper B": c.paper_b,
@@ -95,6 +97,12 @@ class ContradictionReport:
             }
             for c in self.comparisons
         ]
+        if self.predictions and len(self.predictions) == len(rows):
+            for row, prediction in zip(rows, self.predictions):
+                row["Predicted Contradiction"] = prediction.get("prediction", "Low Risk")
+                row["Prediction Score"] = prediction.get("score", 0.0)
+                row["Prediction Reason"] = prediction.get("reason", "")
+        return rows
 
     def contradiction_details(self) -> List[dict]:
         """Full record (claim text + supporting evidence) for every
@@ -284,7 +292,124 @@ def match_claim_pairs(claims_by_paper: Dict[int, List[Claim]]) -> List[Tuple[Cla
 
 
 # --------------------------------------------------------------------------
-# Step 3: classify each matched pair (one batched Groq call)
+# Step 3: lightweight contradiction prediction (rule-based, no LLM)
+# --------------------------------------------------------------------------
+
+_CONTRADICTION_DIRECTION_TERMS = {
+    "increase": "positive",
+    "increases": "positive",
+    "increased": "positive",
+    "improve": "positive",
+    "improves": "positive",
+    "improved": "positive",
+    "boost": "positive",
+    "raise": "positive",
+    "reduce": "negative",
+    "reduces": "negative",
+    "reduced": "negative",
+    "decrease": "negative",
+    "decreases": "negative",
+    "decreased": "negative",
+    "drop": "negative",
+    "drops": "negative",
+    "decline": "negative",
+    "declines": "negative",
+    "worsen": "negative",
+    "worse": "negative",
+    "lower": "negative",
+    "higher": "positive",
+    "better": "positive",
+    "outperform": "positive",
+    "underperform": "negative",
+    "surpass": "positive",
+    "lag": "negative",
+    "fail": "negative",
+    "succeed": "positive",
+}
+
+
+def _tokenize_for_prediction(text: str) -> List[str]:
+    return [tok for tok in re.findall(r"[a-zA-Z]+", (text or "").lower()) if tok]
+
+
+def _extract_numbers(text: str) -> List[float]:
+    return [float(x) for x in re.findall(r"-?\d+(?:\.\d+)?", text)]
+
+
+def _estimate_contradiction_score(claim_a: Claim, claim_b: Claim, similarity: float) -> Tuple[float, str]:
+    text_a = claim_a.claim_text.lower()
+    text_b = claim_b.claim_text.lower()
+    tokens_a = _tokenize_for_prediction(text_a)
+    tokens_b = _tokenize_for_prediction(text_b)
+
+    score = 0.0
+    reason_parts = []
+
+    if claim_a.topic and claim_b.topic and claim_a.topic.lower() == claim_b.topic.lower():
+        score += 0.1
+        reason_parts.append("same topic")
+
+    if similarity >= config.CONTRADICTION_TOPIC_SIMILARITY_THRESHOLD:
+        score += 0.15
+        reason_parts.append("high similarity")
+
+    a_terms = [tok for tok in tokens_a if tok in _CONTRADICTION_DIRECTION_TERMS]
+    b_terms = [tok for tok in tokens_b if tok in _CONTRADICTION_DIRECTION_TERMS]
+    if a_terms and b_terms:
+        a_polarity = _CONTRADICTION_DIRECTION_TERMS.get(a_terms[0], "neutral")
+        b_polarity = _CONTRADICTION_DIRECTION_TERMS.get(b_terms[0], "neutral")
+        if a_polarity != b_polarity and a_polarity != "neutral" and b_polarity != "neutral":
+            score += 0.55
+            reason_parts.append("opposite direction terms")
+
+    nums_a = _extract_numbers(text_a)
+    nums_b = _extract_numbers(text_b)
+    if nums_a and nums_b and len(nums_a) == len(nums_b):
+        if any(x < 0 for x in nums_a) or any(x < 0 for x in nums_b):
+            pass
+    if nums_a and nums_b:
+        score += 0.05
+        reason_parts.append("numeric evidence")
+
+    if any(marker in text_a + text_b for marker in ["vs", "versus", "compared to", "relative to"]):
+        score += 0.05
+        reason_parts.append("comparison framing")
+
+    if any(marker in text_a + text_b for marker in ["not", "no", "never"]):
+        score += 0.03
+        reason_parts.append("negation")
+
+    score = min(1.0, score)
+    reason = "; ".join(reason_parts) if reason_parts else "weak overlap"
+    return score, reason
+
+
+def predict_contradiction_pairs(pairs: List[Tuple[Claim, Claim, float]]) -> List[dict]:
+    """Rule-based prediction of which claim pairs are likely contradictions.
+
+    This is intentionally lightweight and explainable: it uses the same claim
+    text and similarity signal already available in the contradiction pipeline,
+    without requiring an extra LLM call.
+    """
+    predictions = []
+    for claim_a, claim_b, similarity in pairs:
+        score, reason = _estimate_contradiction_score(claim_a, claim_b, similarity)
+        if score >= 0.8:
+            prediction = "Likely Contradiction"
+        elif score >= 0.6:
+            prediction = "Possible Contradiction"
+        else:
+            prediction = "Low Risk"
+        predictions.append({
+            "prediction": prediction,
+            "score": round(score, 3),
+            "reason": reason,
+        })
+    return predictions
+
+
+# --------------------------------------------------------------------------
+# Step 4: classify each matched pair (one batched Groq call)
 # --------------------------------------------------------------------------
 
 CLASSIFICATION_SYSTEM_PROMPT = """You compare pairs of scientific claims from different academic \

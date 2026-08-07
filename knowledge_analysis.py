@@ -415,11 +415,18 @@ def _build_retrieved_chunks_table(papers: List[Paper], rows: List[dict]) -> List
     return table
 
 
-def analyze_papers(papers: List[Paper], rag_cache: Dict[str, PaperIndex]) -> KnowledgeAnalysis:
+def analyze_papers(
+    papers: List[Paper],
+    rag_cache: Dict[str, PaperIndex],
+    max_papers: int = _MAX_PAPERS_TO_ANALYZE,
+) -> KnowledgeAnalysis:
     """Entry point used by app.py after ranking is finished. `rag_cache`
     is the shared {paper title -> PaperIndex} built once by app.py's
-    validation-gated collection loop - reused here, never rebuilt."""
-    papers = papers[:_MAX_PAPERS_TO_ANALYZE]
+    validation-gated collection loop - reused here, never rebuilt.
+    `max_papers` caps how many papers get per-paper Groq extraction calls;
+    defaults to _MAX_PAPERS_TO_ANALYZE but can be set lower by the caller
+    (e.g. Fast mode with display_n=10) to save tokens and time."""
+    papers = papers[:min(max_papers, _MAX_PAPERS_TO_ANALYZE)]
     if not papers:
         return KnowledgeAnalysis()
 

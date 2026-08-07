@@ -7,8 +7,11 @@ to os.environ directly.
 """
 
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
+_PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(_PROJECT_ROOT / ".env")
 load_dotenv()
 
 # --------------------------------------------------------------------------
@@ -43,20 +46,25 @@ BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages
 # --------------------------------------------------------------------------
 # Retrieval / ranking pipeline tuning
 # --------------------------------------------------------------------------
-RESULTS_PER_SOURCE = 20        # how many results to request from each API
-REQUEST_TIMEOUT_SECONDS = 12   # per-request network timeout
-TOP_K_AFTER_EMBEDDING = 30     # candidates kept after cosine-similarity ranking
+RESULTS_PER_SOURCE = 200       # how many results to request from each API
+                                # (raised from 20 → 200 so 5 sources can return
+                                # up to 1,000 raw papers before deduplication)
+REQUEST_TIMEOUT_SECONDS = 30   # per-request network timeout (raised for larger result sets)
+TOP_K_AFTER_EMBEDDING = 500    # candidates kept after cosine-similarity ranking
                                 # before the (more expensive) cross-encoder runs
+                                # (raised from 30 → 500 to cover 1,000+ papers)
 TITLE_SIMILARITY_DEDUP_THRESHOLD = 0.88  # difflib ratio above which two
                                           # titles are considered duplicates
 
 # Rate limiting and retry configuration (handles 429 errors from APIs)
 ENABLE_SEMANTIC_SCHOLAR = os.getenv("ENABLE_SEMANTIC_SCHOLAR", "true").lower() == "true"
                                          # disable if hitting rate limits too often
-API_RETRY_MAX_ATTEMPTS = int(os.getenv("API_RETRY_MAX_ATTEMPTS", "4"))
+API_RETRY_MAX_ATTEMPTS = int(os.getenv("API_RETRY_MAX_ATTEMPTS", "3"))
                                          # max retries for rate-limited (429) API calls
-API_RETRY_INITIAL_DELAY = float(os.getenv("API_RETRY_INITIAL_DELAY", "2.0"))
+                                         # (lowered from 4 → 3 to fail faster and move on)
+API_RETRY_INITIAL_DELAY = float(os.getenv("API_RETRY_INITIAL_DELAY", "1.0"))
                                          # initial delay in seconds, doubles on each retry
+                                         # (lowered from 2.0 → 1.0 for faster recovery)
 
 # Academic source display names (used across retrieve.py / app.py)
 SOURCE_OPENALEX = "OpenAlex"
@@ -78,12 +86,13 @@ CONTRADICTION_MAX_CLAIMS_PER_PAPER = 6  # requested upper bound in the extractio
 # --------------------------------------------------------------------------
 # Knowledge Retrieval module tuning
 # --------------------------------------------------------------------------
-PDF_FETCH_TIMEOUT_SECONDS = 20     # seconds, PDF download (rag_pipeline.py + pdf_extraction.py)
-KNOWLEDGE_EXTRACTION_MAX_WORKERS = 2  # concurrent per-paper Groq calls. Lowered from 4: confirmed
-                                       # via a live probe that this account's Groq tier enforces a
-                                       # shared 12,000-token-per-minute budget across the WHOLE org,
-                                       # not just per request - 4 concurrent Knowledge Extraction
-                                       # calls (each ~6-8k tokens) collide and 429/413 each other.
+PDF_FETCH_TIMEOUT_SECONDS = 12     # seconds, PDF download — 12s fails fast on unresponsive
+                                   # servers instead of waiting the full 20s; most academic
+                                   # PDF servers respond in <5s when they're working at all
+KNOWLEDGE_EXTRACTION_MAX_WORKERS = 3  # concurrent per-paper Groq calls. Groq free-tier
+                                       # enforces ~12k TPM shared budget; 3 workers × ~4k
+                                       # tokens each = ~12k, just at the limit without
+                                       # colliding. Raised from 2 → 3 for 33% faster extraction.
 ROOT_CAUSE_MAX_TOKENS_PER_PAIR = 260  # output budget per contradiction pair being explained
 
 KNOWLEDGE_GAP_CLUSTER_SIMILARITY_THRESHOLD = 0.70  # cosine similarity (vs a cluster's running
@@ -225,3 +234,5 @@ PAPER_VALIDATION_MIN_UNIQUE_WORDS = 100  # minimum DISTINCT word count - catches
                                           # floor above despite containing no real content). A
                                           # real paper's abstract alone clears this by a wide
                                           # margin, so this never rejects genuine papers.
+PAPER_VALIDATION_MIN_ABSTRACT_WORDS = 80  # minimum word count for abstract-only fallbacks
+PAPER_VALIDATION_MIN_ABSTRACT_UNIQUE_WORDS = 30
