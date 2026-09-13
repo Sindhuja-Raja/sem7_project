@@ -695,7 +695,7 @@ def main() -> None:
 
             (
                 tab_papers, tab_validation, tab_overview, tab_knowledge, tab_problem_solution,
-                tab_contradictions, tab_root_cause, tab_ideas, tab_risk, tab_proposal,
+                tab_contradictions, tab_root_cause, tab_ideas,
             ) = st.tabs([
                 ":material/article: Papers",
                 ":material/verified: Validation",
@@ -705,8 +705,6 @@ def main() -> None:
                 ":material/balance: Contradictions",
                 ":material/troubleshoot: Root cause",
                 ":material/lightbulb: Ideas",
-                ":material/warning: Risk indicators",
-                ":material/description: Proposal",
             ])
 
             with tab_papers:
@@ -739,12 +737,6 @@ def main() -> None:
 
             with tab_ideas:
                 render_inventor_agent(valid_papers)
-
-            with tab_risk:
-                render_risk_indicators_tab()
-
-            with tab_proposal:
-                render_proposal_preview_tab()
 
 
 def render_table(title: str, rows: List[dict]) -> None:
@@ -1785,219 +1777,6 @@ def render_root_cause_tab() -> None:
     bubble_fig = _root_cause_bubble_figure(flagged_pairs)
     if bubble_fig:
         st.plotly_chart(bubble_fig, width="stretch")
-
-
-def _field_coverage_gap_pct(knowledge_table: List[dict]) -> Optional[float]:
-    """Average, across the same fields inventor_agent's field_coverage
-    counts, of what fraction of papers are missing that field."""
-    if not knowledge_table:
-        return None
-    total = len(knowledge_table)
-    ratios = []
-    for field_name in _COVERAGE_FIELDS:
-        missing = sum(
-            1 for row in knowledge_table
-            if str(row.get(field_name, NOT_FOUND_IN_CONTEXT)).strip() in ("", NOT_FOUND_IN_CONTEXT)
-        )
-        ratios.append(missing / total)
-    return 100 * sum(ratios) / len(ratios)
-
-
-def _evidence_reliability_risk_pct(knowledge_table: List[dict]) -> Optional[float]:
-    """% of papers whose Evidence Source is anything other than "Full
-    PDF" (i.e. abstract-only or unavailable) - RAG evidence grounded only
-    in an abstract is inherently less reliable than full-text retrieval."""
-    if not knowledge_table:
-        return None
-    total = len(knowledge_table)
-    unreliable = sum(1 for row in knowledge_table if "Full PDF" not in str(row.get("Evidence Source", "")))
-    return 100 * unreliable / total
-
-
-def render_risk_indicators_tab() -> None:
-    """Real-signal risk indicators - every axis is a number already
-    computed elsewhere in this app (field coverage, evidence source,
-    contradiction classification, root-cause confidence). Deliberately no
-    single fabricated "risk score" - a radar of independently-meaningful,
-    fully-traceable signals instead, explicitly labeled as not an ML
-    prediction."""
-    ui_theme.section_header(
-        "⚠️", "Risk Indicators",
-        "Real-signal risk indicators - not a machine-learned failure prediction. Each axis is "
-        "computed directly from retrieval/analysis coverage already shown elsewhere in this app.",
-    )
-    knowledge = st.session_state.get("knowledge_analysis")
-    if knowledge is None or not knowledge.knowledge_table:
-        st.info("Run a search first.")
-        return
-
-    axes: List[str] = []
-    values: List[float] = []
-
-    coverage_risk = _field_coverage_gap_pct(knowledge.knowledge_table)
-    if coverage_risk is not None:
-        axes.append("Field Coverage Gaps")
-        values.append(coverage_risk)
-
-    evidence_risk = _evidence_reliability_risk_pct(knowledge.knowledge_table)
-    if evidence_risk is not None:
-        axes.append("Evidence Reliability Risk")
-        values.append(evidence_risk)
-
-    report: ContradictionReport = st.session_state.get("contradiction_report")
-    if report is not None and report.comparisons:
-        summary = report.summary()
-        total = summary["Total Comparisons"]
-        if total:
-            conflict = summary["Contradiction"] + summary["Partial Contradiction"]
-            axes.append("Contradiction Rate")
-            values.append(100 * conflict / total)
-
-    root_causes = st.session_state.get("contradiction_root_causes")
-    if report is not None and root_causes:
-        flagged_confidences = [
-            rc.confidence for c, rc in zip(report.comparisons, root_causes)
-            if c.classification in ("Contradiction", "Partial Contradiction") and rc.confidence is not None
-        ]
-        if flagged_confidences:
-            axes.append("Root Cause Uncertainty")
-            values.append(100 - sum(flagged_confidences) / len(flagged_confidences))
-
-    if not axes:
-        st.info("No risk signal data available yet.")
-        return
-
-    fig = ui_theme.plotly_radar(
-        axes, values, title="Risk Indicators (higher = more risk)", color=ui_theme.CATEGORY_PALETTE[4],
-    )
-    st.plotly_chart(fig, width="stretch")
-    st.caption(
-        "Computed directly from retrieval/analysis coverage (field coverage gaps, evidence-source "
-        "reliability, contradiction rate, root-cause confidence) - not a machine-learned failure "
-        "prediction."
-    )
-
-    metric_cols = st.columns(len(axes))
-    for col, (axis, value) in zip(metric_cols, zip(axes, values)):
-        col.metric(axis, f"{value:.0f}")
-
-
-def _proposal_markdown(
-    final_recommendation: List[dict], problem_solution_summary: List[dict],
-    research_gap_analysis: List[dict], knowledge_table: List[dict], overall_analysis: List[dict],
-    improvement_table: List[dict],
-) -> str:
-    """Pure formatting over data every other tab already computed - no new
-    extraction, no new LLM call."""
-    by_category = {r["Category"]: r["Value"] for r in final_recommendation}
-    title = by_category.get("Suggested Research Title") or "Untitled Proposal"
-    technique = by_category.get("Recommended AI Technique", NOT_FOUND_IN_CONTEXT)
-    model = by_category.get("Recommended AI Model", NOT_FOUND_IN_CONTEXT)
-    dataset = by_category.get("Recommended Dataset", NOT_FOUND_IN_CONTEXT)
-    framework = by_category.get("Recommended Framework", NOT_FOUND_IN_CONTEXT)
-    metrics = by_category.get("Recommended Evaluation Metrics", NOT_FOUND_IN_CONTEXT)
-    setup = by_category.get("Recommended Experimental Setup", NOT_FOUND_IN_CONTEXT)
-    advantages = by_category.get("Expected Advantages", NOT_FOUND_IN_CONTEXT)
-    risks = by_category.get("Possible Risks", NOT_FOUND_IN_CONTEXT)
-
-    summary_by_category = {r["Category"]: r["Value"] for r in problem_solution_summary}
-    most_common_problem = summary_by_category.get("Most Common Research Problem", NOT_FOUND_IN_CONTEXT)
-
-    gap_labels = [g["Research Gap"] for g in research_gap_analysis[:3]]
-    accuracy_entry = next((r for r in overall_analysis if r["Category"] == "Highest Reported Accuracy"), None)
-    best_accuracy = accuracy_entry.get("Most Common", NOT_FOUND_IN_CONTEXT) if accuracy_entry else NOT_FOUND_IN_CONTEXT
-
-    related_work_lines = [
-        f"| {row.get('Paper Title', '')} | {row.get('Year', '')} | {row.get('AI Technique', '')} | "
-        f"{row.get('Key Contributions', '')} |"
-        for row in knowledge_table
-    ]
-    related_work_table = (
-        "| Paper | Year | AI Technique | Key Contribution |\n|---|---|---|---|\n" + "\n".join(related_work_lines)
-        if related_work_lines else "_No papers analyzed._"
-    )
-
-    limitation_lines = [f"- **{row['Problem']}:** {row['Suggested Improvement']}" for row in improvement_table[:5]]
-    limitations_section = "\n".join(limitation_lines) if limitation_lines else "_None identified._"
-
-    gap_sentence = (
-        " Key research gaps identified across the literature: " + "; ".join(gap_labels) + "."
-        if gap_labels else ""
-    )
-    abstract = (
-        f"This work proposes {technique} using {model}, evaluated on {dataset}"
-        + (f" with {framework}" if framework != NOT_FOUND_IN_CONTEXT else "")
-        + f", addressing {most_common_problem}. {advantages}"
-    )
-    conclusion_problem = most_common_problem.lower() if most_common_problem != NOT_FOUND_IN_CONTEXT else "the identified research problem"
-
-    return f"""# {title}
-
-## Abstract
-{abstract}
-
-## I. Introduction
-The reviewed literature most commonly addresses **{most_common_problem}**.{gap_sentence}
-
-## II. Related Work
-{related_work_table}
-
-## III. Proposed Methodology
-- **AI Technique:** {technique}
-- **AI Model:** {model}
-- **Dataset:** {dataset}
-- **Framework:** {framework}
-- **Evaluation Metrics:** {metrics}
-- **Experimental Setup:** {setup}
-
-## IV. Expected Results
-{advantages}
-
-Best reported result in the analyzed literature: **{best_accuracy}**.
-
-## V. Risks & Limitations
-{risks}
-
-{limitations_section}
-
-## VI. Conclusion
-This proposal builds on {conclusion_problem} by combining {technique} with {model}, targeting the \
-gaps and limitations identified across the reviewed literature.
-"""
-
-
-def render_proposal_preview_tab() -> None:
-    ui_theme.section_header(
-        "📝", "Proposal Preview",
-        "An IEEE-style formatted document assembled from the Inventor Agent's Final Recommendation "
-        "and the analysis above - pure formatting, no new extraction.",
-    )
-    recommendation = st.session_state.get("inventor_recommendation")
-    if recommendation is None or recommendation.insufficient_evidence or not recommendation.final_recommendation:
-        st.info(
-            "Run Ideas & Recommendations first - the Proposal Preview is assembled from its "
-            "Final Recommendation."
-        )
-        return
-
-    knowledge = st.session_state.get("knowledge_analysis")
-    problem_solution = st.session_state.get("problem_solution_analysis")
-
-    markdown = _proposal_markdown(
-        recommendation.final_recommendation,
-        problem_solution.summary if problem_solution else [],
-        knowledge.research_gap_analysis if knowledge else [],
-        knowledge.knowledge_table if knowledge else [],
-        knowledge.overall_analysis if knowledge else [],
-        recommendation.improvement_table,
-    )
-
-    with st.container(border=True):
-        st.markdown(markdown)
-
-    st.download_button(
-        "Download as Markdown", data=markdown, file_name="research_proposal.md", mime="text/markdown",
-    )
 
 
 if __name__ == "__main__":
