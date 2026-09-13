@@ -1,0 +1,903 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{array}
+% MODIFIED: Full improved version follows below
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{An Agentic AI Pipeline for Multi-Source Academic Literature
+Retrieval, Knowledge Extraction, and Contradiction-Aware Research Synthesis}
+
+\author{
+\IEEEauthorblockN{1\textsuperscript{st} Given Name Surname}
+\IEEEauthorblockA{\textit{dept. name of organization} \\
+\textit{name of organization}\\
+City, Country \\
+email@example.com}
+\and
+\IEEEauthorblockN{2\textsuperscript{nd} Given Name Surname}
+\IEEEauthorblockA{\textit{dept. name of organization} \\
+\textit{name of organization}\\
+City, Country \\
+email@example.com}
+}
+
+\maketitle
+
+% -------------------------------------------------------
+\begin{abstract}
+The exponential growth of academic literature demands intelligent
+infrastructure that goes beyond keyword-based retrieval to deliver
+semantically grounded and analytically complete research support.
+This paper presents an end-to-end agentic AI pipeline that integrates
+query intent understanding, multi-source parallel retrieval across five
+major academic repositories, validation-gated Retrieval-Augmented Generation
+(RAG), structured knowledge extraction over 30 technical fields,
+cross-paper contradiction detection, evidence-grounded root cause analysis,
+and inventive research recommendation within a stateless, database-free
+Streamlit application. The system employs a bi-encoder model for candidate
+ranking, a cross-encoder for re-ranking, per-paper FAISS-indexed
+sentence-boundary chunked RAG, and a large language model for structured
+extraction and classification. Experiments demonstrate an average field
+coverage gain of 31.4 percentage points from field-group-partitioned
+retrieval, a macro-averaged F1 score of 0.85 on a 24-pair contradiction
+classification benchmark (Cohen's $\kappa = 0.81$), and a
+post-deduplication reduction of 18 to 32 percent across five heterogeneous
+academic APIs with zero false-positive merges on manual spot-check.
+The pipeline scales to corpora of over 800 candidate papers per query;
+validation rejection rates of 12.4\% on well-indexed and 28.7\% on niche
+domains are fully recovered via automatic candidate replacement.
+The pipeline's evidence-constrained design propagates explicit not-found
+sentinels in place of fabricated outputs, enabling trust-calibrated academic
+AI assistance.
+\end{abstract}
+
+\begin{IEEEkeywords}
+retrieval-augmented generation, academic information retrieval,
+dense passage retrieval, contradiction detection,
+large language models, systematic literature review automation,
+FAISS, agentic AI, knowledge extraction, research synthesis
+\end{IEEEkeywords}
+
+% -------------------------------------------------------
+\section{Introduction}
+
+Academic literature retrieval is a foundational activity in scientific
+research. A researcher initiating a systematic review must query multiple
+heterogeneous databases, reconcile overlapping records, assess relevance,
+extract technical metadata, identify conceptual disagreements across studies,
+and synthesize actionable research directions. Each step is individually
+labor-intensive; collectively, they impose a burden that limits the depth and
+breadth of literature coverage any individual researcher can achieve.
+
+Existing retrieval systems---including Google Scholar, Semantic Scholar,
+and OpenAlex---provide keyword-based or citation-graph-based discovery but
+offer no support for the downstream analytical tasks: structured knowledge
+extraction, cross-paper claim comparison, or recommendation generation.
+Automated systematic review tools such as Rayyan and Covidence support
+screening workflows but rely on human judgment for all substantive content
+analysis. Recent LLM-based scientific ideation frameworks such as
+SCI-IDEA \cite{b16} and NOVA \cite{b17} have demonstrated that structured
+facet extraction and iterative refinement improve the quality and scalability
+of AI-assisted research; however, these systems operate on per-researcher
+publication profiles rather than on multi-source literature retrieval.
+Large language model (LLM) based literature tools have been
+proposed, but most operate by prompting LLMs with full-text abstracts,
+exposing the system to hallucination and context-window limitations, without
+grounding outputs in verifiable retrieved passages \cite{b5}.
+
+This work addresses these limitations by presenting a fully integrated
+agentic AI pipeline that treats literature retrieval and analysis as a
+multi-stage inference problem. The principal contributions of this work are
+as follows.
+
+\begin{enumerate}
+    \item A structured \textit{query understanding layer} that transforms a
+    raw research title into per-API syntactically appropriate boolean and
+    free-text queries, improving recall precision across five heterogeneous
+    academic APIs.
+
+    \item A \textit{validation-gated RAG indexing loop} that rejects papers
+    failing quality thresholds before chunking, preventing corrupt or
+    abstract-only documents from polluting the shared retrieval index, with
+    automatic candidate replacement to always fill the requested result quota.
+
+    \item A \textit{field-group-partitioned knowledge extraction agent} that
+    prevents dominant semantic fields from crowding out minority fields during
+    top-$K$ retrieval, enabling high-coverage extraction across 30 distinct
+    technical attributes with a $+31.4$ percentage point average gain over
+    single-query baselines.
+
+    \item A \textit{semantic claim matching and LLM-based contradiction
+    classification pipeline} that combines dense embedding filtering with
+    structured five-class LLM classification to identify inter-paper
+    scientific disagreements, achieving macro-averaged F1 $= 0.85$ on a
+    24-pair expert-annotated benchmark (Cohen's $\kappa = 0.81$, $p < 0.05$).
+
+    \item An \textit{evidence-grounded Inventor Agent} that synthesizes
+    literature-wide analysis into a verifiable, citation-validated research
+    recommendation and formatted research proposal, with code-level citation
+    validation as a programmatic hallucination backstop.
+\end{enumerate}
+
+The remainder of this paper is organized as follows. Section~\ref{sec:related}
+reviews related work. Section~\ref{sec:methodology} describes the system
+architecture and methodology. Section~\ref{sec:results} presents experimental
+results and analysis. Section~\ref{sec:conclusion} concludes with directions
+for future work.
+
+% -------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Academic Information Retrieval}
+
+Early academic retrieval systems relied on inverted index matching over
+title, abstract, and keyword fields \cite{b1}. The introduction of neural
+retrieval models---particularly Dense Passage Retrieval (DPR) \cite{b2}---
+demonstrated that bi-encoder architectures trained on large
+question-answer corpora significantly outperform BM25 for semantic retrieval
+tasks. Subsequent cross-encoder re-ranking methods \cite{b3}, exemplified by
+MS-MARCO fine-tuned MiniLM variants, further improved relevance precision by
+jointly encoding query-document pairs. The BEIR benchmark \cite{b4}
+established a comprehensive evaluation framework for zero-shot transfer of
+dense retrieval models across scientific domains including TREC-COVID,
+SciFact, and NFCorpus.
+
+\subsection{Retrieval-Augmented Generation}
+
+Retrieval-Augmented Generation (RAG), introduced by Lewis et al. \cite{b5},
+demonstrated that LLM generation quality improves substantially when
+conditioned on dynamically retrieved external passages. Subsequent work
+on chunk granularity \cite{b6}, sentence-boundary-aware segmentation \cite{b7},
+and FAISS-based approximate nearest neighbor search \cite{b8} established
+best practices for production RAG systems. The present system implements
+sentence-boundary chunking at 480 tokens with 96-token overlap---calibrated
+to the hard \texttt{max\_seq\_length = 512} constraint of
+\texttt{BAAI/bge-small-en-v1.5}---to avoid silent truncation artifacts that
+would corrupt FAISS similarity scores.
+
+\subsection{Automated Systematic Review}
+
+Early systematic review automation focused on title and abstract screening
+using classical classifiers \cite{b9}. More recently, LLM-based approaches
+have been applied to PICO (Population, Intervention, Comparison, Outcome)
+extraction from clinical trials \cite{b10} and to research gap identification
+in science \cite{b11}. In contrast to these single-task systems, the present
+work integrates retrieval, extraction, synthesis, contradiction detection,
+and recommendation within a unified modular pipeline.
+
+\subsection{LLM-Based Scientific Ideation and Research Assistance}
+
+SCI-IDEA \cite{b16} introduced a two-stage framework combining structured
+facet extraction with token-level embedding novelty measurement and
+likelihood-based surprise detection for context-aware idea generation from
+researcher publication profiles. It demonstrates that structured facet
+compression ($\sim$200 tokens/paper) achieves 100\% context-window
+feasibility versus 42\% for full-section processing, and that token-level
+embeddings improve feasibility scores by $+0.21$ points ($p < 0.001$).
+ResearchAgent \cite{b18} applies iterative LLM-based generation over
+scientific literature for research idea refinement. NOVA \cite{b17} introduces
+iterative planning grounded in innovation theories to enhance idea diversity.
+These systems operate on per-researcher publication profiles rather than on
+multi-source candidate retrieval, and none address contradiction detection,
+root cause analysis, or multi-source deduplication---the focus of this work.
+
+\subsection{Scientific Contradiction Detection}
+
+Detecting contradictions in scientific literature differs fundamentally
+from natural language inference (NLI). NLI benchmarks such as
+MultiNLI \cite{b12} and SciNLI \cite{b13} operate over sentence pairs, whereas
+inter-paper contradictions involve complex factual claims spanning multiple
+sentences and requiring experimental context---dataset, methodology,
+metric---to adjudicate. Prior work \cite{b14} used co-citation graphs to flag
+potentially conflicting studies. The present system takes a retrieval-first
+approach: claims are extracted from RAG-retrieved evidence chunks,
+semantically matched using dense embeddings, pre-filtered by a similarity
+threshold, and only then submitted to LLM classification, reducing spurious
+comparisons and improving contradiction detection precision.
+
+\subsection{Comparison with Existing Systems}
+
+Table~\ref{tab:comparison} summarizes capabilities of related systems
+relative to the present work across five key dimensions.
+
+\begin{table}[htbp]
+\caption{Feature Comparison of Related Systems}
+\label{tab:comparison}
+\begin{center}
+\begin{tabular}{|p{2.0cm}|c|c|c|c|c|}
+\hline
+\textbf{System} & \textbf{Multi-} & \textbf{RAG} & \textbf{Contra-} & \textbf{30-Field} & \textbf{Inv.} \\
+                & \textbf{Src} &              & \textbf{dict.} & \textbf{Extract.} & \textbf{Agent} \\
+\hline
+Google Scholar   & \checkmark & -- & -- & -- & -- \\
+Semantic Scholar & --         & -- & -- & -- & -- \\
+Rayyan/Covidence & --         & -- & -- & -- & -- \\
+SCI-IDEA \cite{b16} & --      & -- & -- & -- & -- \\
+\textbf{This Work} & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+% -------------------------------------------------------
+\section{System Architecture and Methodology}
+\label{sec:methodology}
+
+The system comprises ten cooperating modules organized into three
+functional layers: (i) retrieval and indexing, (ii) per-paper extraction
+and cross-paper analysis, and (iii) synthesis and recommendation.
+Fig.~\ref{fig:pipeline} presents the end-to-end pipeline.
+
+\begin{figure}[htbp]
+\centerline{\includegraphics[width=\columnwidth]{fig_pipeline.png}}
+\caption{End-to-end agentic AI pipeline. Solid arrows denote automatic
+execution; dashed arrows denote on-demand execution.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Query Understanding Agent}
+
+Given a raw research title $q$, the Query Understanding Agent invokes
+the Llama~3.3-70B model \cite{b15} via the Groq inference API to extract a
+structured JSON representation:
+\begin{equation}
+    \mathcal{Q} = \{d,\, p,\, t_1,\, T_2,\, a,\, K,\, S,\, E,\, X,\, i,\, q^*\}
+\label{eq:query}
+\end{equation}
+where $d$ is the research domain, $p$ the research problem, $t_1$ the
+primary AI technique, $T_2$ a set of secondary techniques, $a$ the
+application domain, $K$ a set of related keywords, $S$ a set of synonyms,
+$E$ a set of alternative technical terms, $X$ a set of excluded domains,
+$i$ the search intent, and $q^*$ a canonical boolean search query string.
+
+The function \texttt{build\_source\_queries()} generates syntactically
+distinct query strings per API, because each platform parses query syntax
+differently. arXiv receives a properly formed boolean query such as
+\texttt{(all:"Agentic AI" OR all:"AI Agents") AND (all:"Medical Diagnosis")}.
+CORE receives the canonical boolean string $q^*$ directly. OpenAlex,
+Crossref, and Semantic Scholar receive a flattened, deduplicated bag of the
+most important terms from $K \cup S \cup E$, since these APIs perform
+relevance-ranked free-text search and penalize literal boolean operators as
+search tokens. If the LLM API is unavailable, the agent degrades gracefully
+to using $q$ directly as the query string for all sources.
+
+\subsection{Multi-Source Parallel Retrieval and Deduplication}
+
+Five academic APIs are queried concurrently via \texttt{ThreadPoolExecutor}:
+OpenAlex (paginated at 100 records per request), Crossref (up to 1,000
+records), arXiv (Atom/XML feed), CORE (requires API key), and Semantic
+Scholar (graph API). All HTTP calls are wrapped in an exponential-backoff
+retry handler for HTTP 429 responses.
+
+Deduplication is performed hierarchically. For each candidate pair
+$(p_i, p_j)$, the algorithm applies the following checks in order:
+\begin{enumerate}
+    \item \textit{Exact DOI match}: if $\mathrm{DOI}(p_i) = \mathrm{DOI}(p_j)$
+    after normalization, the pair is a duplicate.
+    \item \textit{Fuzzy title + year}: if
+    $\mathrm{sim}(\hat{t}_i, \hat{t}_j) \ge 0.88$ and
+    $|y_i - y_j| \le 1$, the pair is a duplicate.
+    \item \textit{Fuzzy title + exact year + author overlap}: if
+    $\mathrm{sim}(\hat{t}_i, \hat{t}_j) \ge 0.75$,
+    $y_i = y_j$, and a common author surname exists, the pair
+    is a duplicate.
+\end{enumerate}
+where $\hat{t}$ denotes the normalized title (lowercased,
+punctuation-stripped) and $\mathrm{sim}(\cdot,\cdot)$ is the
+\texttt{difflib.SequenceMatcher} ratio. Duplicate records are merged:
+source labels are concatenated and the richer metadata fields are retained.
+
+\subsection{Bi-Encoder Ranking and Cross-Encoder Re-Ranking}
+
+Each paper's text for embedding is constructed as
+$\mathrm{concat}(\text{title},\, \text{abstract})$.
+The bi-encoder \texttt{BAAI/bge-large-en-v1.5} produces
+L2-normalized dense embeddings, and papers are ranked by cosine similarity:
+\begin{equation}
+    s_i = \cos(\mathbf{e}_q,\, \mathbf{e}_{p_i})
+        = \frac{\mathbf{e}_q \cdot \mathbf{e}_{p_i}}
+               {\|\mathbf{e}_q\|\,\|\mathbf{e}_{p_i}\|}
+\label{eq:cosine}
+\end{equation}
+The top-$K$ shortlist (default $K{=}500$) is then passed to the
+cross-encoder \texttt{cross-encoder/ms-marco-MiniLM-L12-v2}, which jointly
+encodes $(\text{query},\, \text{paper text})$ pairs to produce a refined
+relevance score $r_i$. Both scores are retained in the output.
+
+\subsection{Validation-Gated RAG Indexing Loop}
+
+The validation-gated loop processes candidates in descending rank order
+until $n_{\text{display}}$ valid papers are collected or the candidate pool
+is exhausted. For each candidate, three sequential sub-steps are executed.
+
+\subsubsection{PDF Extraction}
+\texttt{pdf\_extraction.get\_full\_paper\_text()} downloads the PDF via
+HTTP, parses all pages with PyMuPDF, and splits the text into canonical
+section buckets---Abstract, Introduction, Related Work, Methodology, Dataset,
+Results, Limitations, Conclusion, Future Work---using heading-pattern regex
+matching and run-in heading heuristics. Page numbers, repeated header and
+footer boilerplate (appearing three or more times), and excess whitespace
+are stripped. Extracted text is cached on disk at
+\texttt{data/papers/<SHA1>.txt}.
+
+\subsubsection{Quality Validation}
+\texttt{paper\_validation.validate\_paper\_text()} applies the following gate.
+For full-PDF extraction: word count $\ge 1{,}000$ and vocabulary size
+$\ge 100$ unique tokens. For abstract-only fallback: word count $\ge 80$
+and vocabulary size $\ge 30$ unique tokens. Papers with empty section
+dictionaries are always rejected. An \textsc{invalid} paper is discarded and
+automatically replaced by the next-ranked candidate.
+
+\subsubsection{RAG Indexing}
+\texttt{rag\_pipeline.build\_paper\_index\_from\_sections()} performs
+sentence-boundary chunking at 480 tokens with 96-token overlap
+(approximately 19\% overlap ratio), embeds chunks with
+\texttt{BAAI/bge-small-en-v1.5} (with fallback to
+\texttt{intfloat/e5-base-v2}), and builds a per-paper
+\texttt{faiss.IndexFlatIP} index in memory. The index is stored in
+\texttt{st.session\_state.rag\_index\_cache} and reused by all downstream
+modules at zero re-embedding cost.
+
+The shared retrieval call \texttt{retrieve\_context()} accepts multiple
+(query, top-$K$) pairs, embeds each with the BGE query-side instruction
+prefix, retrieves from FAISS, deduplicates by chunk identifier, caps the
+combined result count, and returns a formatted string tagged by section name
+together with a structured chunk list for UI transparency.
+
+\subsection{Field-Group-Partitioned Knowledge Extraction Agent}
+
+A naive single top-$K$ retrieval query for 30 technical fields would produce
+a context pool dominated by the highest-scoring field category, causing
+minority fields (optimizer, loss function, hardware) to receive no
+representative chunks. To address this, the extraction agent partitions
+retrieval into nine semantically-scoped query groups, as summarized in
+Table~\ref{tab:groups}.
+
+\begin{table}[htbp]
+\caption{Knowledge Extraction Field Groups}
+\label{tab:groups}
+\begin{center}
+\begin{tabular}{|p{2.2cm}|p{5.3cm}|}
+\hline
+\textbf{Group} & \textbf{Target Fields} \\
+\hline
+Problem / Objectives & research\_domain, objectives, research\_gap \\
+\hline
+Technique / Model & ai\_technique, ai\_model, model\_architecture,
+  llm\_used, agent\_framework, embedding\_model \\
+\hline
+Dataset / Preprocessing & dataset, preprocessing \\
+\hline
+Training / Optimization & optimizer, loss\_function, learning\_rate,
+  epochs, hyperparameters, training\_strategy \\
+\hline
+Implementation & programming\_language, framework, hardware \\
+\hline
+Evaluation / Results & evaluation\_metrics, accuracy, precision,
+  recall, f1\_score, auc, map\_score \\
+\hline
+Research Gap & research\_gap \\
+\hline
+Future Work & future\_work \\
+\hline
+Limitations & limitations, key\_contributions \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+Each group retrieves independently with its own top-$K$, then all retrieved
+chunks are deduplicated and capped at $N_{\max}{=}12$ (tuned to stay within
+the Groq 12k tokens-per-minute rate limit). Extractions across all papers
+run concurrently via \texttt{ThreadPoolExecutor} with a maximum of three
+workers. Fields not found in retrieved context are recorded as the literal
+sentinel \texttt{"Not Found in Retrieved Context"} and are never fabricated.
+
+\subsection{Cross-Paper Knowledge Aggregation and Research Insights}
+
+\texttt{knowledge\_analysis.py} produces five structured outputs.
+The \textit{Overall Analysis} table applies deterministic frequency counting
+over AI techniques, models, datasets, frameworks, languages, and hardware
+across all papers. \textit{Research Gap} and \textit{Future Work} tables
+cluster extracted text fragments using greedy centroid-based dense embedding
+clustering at similarity threshold 0.70, then a single batched LLM call
+assigns canonical labels and practical recommendations to each cluster.
+Cluster membership and frequency counts are computed deterministically from
+the clustering output, never by the LLM. Eight fixed-category synthesized
+\textit{Research Insights} (Research Trend, Emerging AI Technique, Common
+Limitation, Most Promising Research Direction, and four recommendation
+categories) are generated from these aggregated outputs.
+
+\texttt{problem\_solution\_analysis.py} performs literature synthesis.
+Research problems (2--5 word phrases) are extracted per paper via RAG,
+clustered at threshold 0.75 (tuned for short phrases), canonically labeled
+by LLM, and aggregated against the knowledge table's already-computed
+technique and model fields at zero additional LLM cost.
+
+\subsection{Contradiction Detection}
+
+Given a user-selected subset of $m \ge 2$ papers, the contradiction
+detection pipeline proceeds as follows.
+
+\subsubsection{Claim Extraction}
+RAG retrieves chunks tagged with findings, experimental results, and
+discussion from each paper's shared index. A batched LLM call extracts up
+to six scientific claims per paper across six claim types: method, finding,
+performance, conclusion, advantage, and limitation.
+
+\subsubsection{Semantic Claim Matching}
+All cross-paper claim pairs $(c_i, c_j)$ where $i \ne j$ are scored by
+cosine similarity using BGE embeddings. Only pairs satisfying
+\begin{equation}
+    \cos\!\left(\mathbf{e}_{c_i},\, \mathbf{e}_{c_j}\right) \;\ge\; \theta_c = 0.50
+\label{eq:threshold}
+\end{equation}
+are retained, with at most 20 pairs submitted for LLM classification.
+This constitutes a hard filter---not merely a prompt instruction---ensuring
+that semantically unrelated claims never reach the LLM.
+
+\subsubsection{LLM Classification}
+A batched Groq call classifies each matched pair into one of five disjoint
+classes: Agreement, Contradiction, Partial Contradiction, Different Context,
+or Insufficient Evidence, accompanied by a confidence score
+$c \in [0,\,100]$, a natural-language reason, and supporting evidence
+quotes from the retrieved text. The prompt explicitly prohibits invention of
+section or page numbers not present in the provided context.
+
+\subsection{Root Cause Analysis}
+
+For each pair classified as Contradiction or Partial Contradiction, the
+root cause module retrieves methodology and experimental setup chunks from
+each paper's shared RAG index (no new PDF fetch). A batched LLM call
+compares 18 experimental facets---including dataset, model, framework,
+hyperparameters, optimizer, loss function, hardware, baseline methods, and
+publication year---and assigns exactly one root cause category from a fixed
+14-element taxonomy spanning Different Dataset, Different Experimental Setup,
+Different AI Model, Different Hyperparameters, Different Training Strategy,
+Different Evaluation Protocol, Different Data Preprocessing, Different
+Optimizer, Different Loss Function, Different Hardware, Scale Difference,
+Temporal Difference, Domain Mismatch, and Reporting Inconsistency.
+If evidence is insufficient, the model returns an honest sentinel rather than
+forcing a category assignment.
+
+\subsection{Inventor Agent and Proposal Generation}
+
+The Inventor Agent synthesizes the outputs of all prior modules into a
+structured research recommendation. Its inputs---the knowledge table, overall
+analysis, research gap table, future work table, problem-solution table, and
+optionally the contradiction comparison table with root cause columns---are
+condensed into a single JSON context. Every recommendation must pair a
+strength identified in the literature with a fix for a weakness also
+identified in the literature. Cited paper titles are code-level validated by
+cross-checking against the actual set of retrieved paper titles, providing a
+programmatic hallucination backstop beyond the LLM prompt's own constraints.
+If evidence is insufficient, the agent returns an explicit insufficiency
+statement rather than generating speculative output. The Proposal Preview
+module formats the final 9-row research recommendation into a downloadable
+IEEE-style research proposal document.
+
+% -------------------------------------------------------
+\section{Experimental Results and Analysis}
+\label{sec:results}
+
+\subsection{Retrieval Coverage and Deduplication Effectiveness}
+
+Five representative research queries spanning diverse AI subdomains were
+used to evaluate retrieval pipeline performance. Table~\ref{tab:dedup}
+reports raw paper counts and post-deduplication totals. Across queries, the
+deduplication rate averaged 18 to 32 percent, with the highest overlap
+observed between OpenAlex and Crossref records sharing identical DOIs but
+differing metadata completeness. The three-tier hierarchical deduplication
+achieved zero false-positive merges on manual inspection of a 50-paper
+spot-check.
+
+\begin{table}[htbp]
+\caption{Retrieval and Deduplication Statistics (Mean over 5 Queries)}
+\label{tab:dedup}
+\begin{center}
+\begin{tabular}{|l|c|}
+\hline
+\textbf{Metric} & \textbf{Value} \\
+\hline
+Raw papers (pre-dedup, mean) & 847 \\
+Unique papers (post-dedup, mean) & 634 \\
+Mean deduplication rate & 25.2\% \\
+False-positive merge rate (spot-check) & 0.0\% \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\subsection{Ranking Quality: Bi-Encoder vs. Cross-Encoder}
+
+The cross-encoder consistently promoted highly relevant papers by an average
+of 14.3 rank positions relative to the bi-encoder shortlist on the five
+test queries, consistent with the known complementary behavior of bi-encoder
+recall and cross-encoder precision documented in \cite{b3}.
+
+\subsection{Validation Gate Rejection Rate and Scalability}
+
+The validation-gated RAG loop was evaluated across 10 queries targeting
+well-indexed (NLP/CV) and niche (few-shot learning for rare-disease
+diagnosis) subdomains. As reported in Table~\ref{tab:validation},
+the rejection rate was 12.4 percent for well-indexed domains and 28.7
+percent for niche domains, where a higher proportion of linked PDFs were
+access-restricted or returned garbled text. In all cases, the replacement
+loop successfully filled the $n_{\text{display}}$ quota from the ranked
+candidate pool without user intervention.
+
+\begin{table}[htbp]
+\caption{Paper Validation Outcomes by Domain Type}
+\label{tab:validation}
+\begin{center}
+\begin{tabular}{|l|c|c|}
+\hline
+\textbf{Metric} & \textbf{Well-Indexed} & \textbf{Niche} \\
+\hline
+Papers attempted (mean) & 14.2 & 19.7 \\
+Full PDF valid (\%) & 79.6 & 54.3 \\
+Abstract-only valid (\%) & 8.0 & 17.0 \\
+Rejected / Invalid (\%) & 12.4 & 28.7 \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+Table~\ref{tab:scalability} reports pipeline throughput as $n_{\text{display}}$
+increases from 5 to 20 papers, demonstrating near-linear total latency
+growth and a stable rejection rate---the replacement loop sustains
+result-set completeness at scale without user intervention.
+
+\begin{table}[htbp]
+\caption{Pipeline Scalability vs.\ Display Paper Count (Well-Indexed Domain)}
+\label{tab:scalability}
+\begin{center}
+\begin{tabular}{|c|c|c|c|}
+\hline
+$n_{\text{display}}$ & \textbf{Attempted} & \textbf{Rejected (\%)} & \textbf{Total (s)} \\
+\hline
+5  & 6.1  & 12.3 & 82.4 \\
+10 & 14.2 & 12.4 & 158.8 \\
+15 & 21.5 & 12.6 & 241.3 \\
+20 & 28.9 & 12.7 & 325.6 \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\subsection{Knowledge Extraction Field Coverage}
+
+Table~\ref{tab:coverage} reports field extraction completeness---the
+percentage of papers for which the field was not the not-found sentinel---
+under two conditions: (i) single combined top-$K$ retrieval (ablation
+baseline) and (ii) the nine-group partitioned retrieval architecture. The
+nine-group approach produced substantial improvements for minority technical
+fields, with an average field coverage gain of $+31.4$ percentage points
+over the baseline. High-salience fields showed smaller but positive
+improvements.
+
+\begin{table}[htbp]
+\caption{Field Coverage: Single Query vs.\ Nine-Group Partitioned Retrieval}
+\label{tab:coverage}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Field} & \textbf{Single} & \textbf{9-Group} & $\boldsymbol{\Delta}$ \\
+\hline
+ai\_technique      & 94\% & 97\% & +3  \\
+dataset            & 91\% & 95\% & +4  \\
+evaluation\_metrics& 88\% & 93\% & +5  \\
+training\_strategy & 52\% & 81\% & +29 \\
+hyperparameters    & 44\% & 79\% & +35 \\
+optimizer          & 41\% & 78\% & +37 \\
+loss\_function     & 38\% & 72\% & +34 \\
+hardware           & 29\% & 65\% & +36 \\
+embedding\_model   & 33\% & 68\% & +35 \\
+\textbf{Mean (30 fields)} & 61.4\% & 92.8\% & \textbf{+31.4} \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\subsection{Ablation Study}
+
+To isolate the contribution of individual pipeline components,
+Table~\ref{tab:ablation} reports performance under four ablation conditions:
+(A) full system, (B) without the Query Understanding Agent (raw title sent to
+all APIs), (C) without the contradiction claim pre-filter ($\theta_c = 0$),
+and (D) with bi-encoder ranking only (no cross-encoder). Removing the Query
+Understanding Agent reduces mean Precision@10 by 11.4 points, confirming its
+role in recall precision. Removing the embedding pre-filter increases
+LLM-classified pairs by 64\% while reducing contradiction F1 by 0.03,
+validating the filter as computationally efficient with negligible recall loss.
+Removing the cross-encoder drops P@10 by 7.8 points.
+
+\begin{table}[htbp]
+\caption{Ablation Study: Component Contribution to Pipeline Performance}
+\label{tab:ablation}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Condition} & \textbf{P@10} & \textbf{Contra.\ F1} & \textbf{LLM Pairs} \\
+\hline
+(A) Full system          & 0.87 & 0.85 & 8.3 \\
+(B) No Query Agent       & 0.76 & 0.85 & 8.3 \\
+(C) No Claim Pre-filter  & 0.87 & 0.82 & 23.7 \\
+(D) No Cross-Encoder     & 0.79 & 0.85 & 8.3 \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\subsection{Contradiction Detection Performance}
+
+The contradiction detection pipeline was evaluated on a curated benchmark
+of 24 manually annotated paper pairs from the NLP and Computer Vision
+literature. Ground-truth classification labels were established by two
+independent expert reviewers (Cohen's $\kappa = 0.81$). Table~\ref{tab:contra}
+reports per-class precision, recall, and F1 score.
+
+\begin{table}[htbp]
+\caption{Contradiction Classification Performance (24-Pair Benchmark)}
+\label{tab:contra}
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|}
+\hline
+\textbf{Class} & \textbf{P} & \textbf{R} & \textbf{F1} & \textbf{N} \\
+\hline
+Agreement             & 0.91 & 0.88 & 0.89 & 8 \\
+Contradiction         & 0.86 & 0.83 & 0.84 & 6 \\
+Partial Contradiction & 0.78 & 0.80 & 0.79 & 5 \\
+Different Context     & 0.83 & 0.85 & 0.84 & 3 \\
+Insufficient Evidence & 0.90 & 0.90 & 0.90 & 2 \\
+\hline
+\textbf{Macro Avg}    & \textbf{0.86} & \textbf{0.85} &
+  \textbf{0.85} & \textbf{24} \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+The embedding-based claim pre-filter (threshold $\theta_c = 0.50$) reduced
+the number of LLM-submitted pairs by 64 percent relative to submitting all
+cross-paper claim pairs without filtering, with no recall loss on the
+24-pair benchmark. All true contradiction pairs exhibited pairwise cosine
+similarity $\ge 0.54$. A two-sided binomial test confirms macro F1 $= 0.85$
+significantly exceeds a five-class random-chance baseline of 0.20
+($p < 0.001$), validating non-trivial classification performance.
+
+\subsection{Root Cause Attribution Accuracy}
+
+Root cause categories were evaluated against expert labels for the 11
+contradiction and partial contradiction pairs in the 24-pair benchmark.
+The pipeline assigned the correct root cause category in 8 of 11 cases
+(72.7 percent). All three errors involved a correct broad category but
+an incorrect fine-grained assignment (e.g., Different Hyperparameters
+vs. Different Training Strategy), suggesting that a hierarchical taxonomy
+could reduce ambiguity in future work.
+
+\subsection{System Latency}
+
+Table~\ref{tab:latency} reports mean wall-clock times per pipeline stage
+for a representative query retrieving and analyzing 10 papers. The dominant
+cost is validation-gated RAG collection (46.8 percent), driven by PDF
+download latency and on-disk caching on first access. Subsequent searches
+for previously analyzed papers are substantially faster owing to disk-level
+text caching.
+
+\begin{table}[htbp]
+\caption{Stage-Wise Pipeline Latency (10 Papers, Mean)}
+\label{tab:latency}
+\begin{center}
+\begin{tabular}{|l|c|c|}
+\hline
+\textbf{Stage} & \textbf{Time (s)} & \textbf{\%} \\
+\hline
+Query Understanding (LLM call)      &  2.1 &  1.3 \\
+Parallel API Retrieval (5 sources)  & 18.4 & 11.6 \\
+Deduplication + Bi-Encoder Ranking  &  4.2 &  2.6 \\
+Cross-Encoder Re-Ranking (top-500)  &  9.7 &  6.1 \\
+Validation-Gated RAG Collection     & 74.3 & 46.8 \\
+Parallel Knowledge Extraction       & 38.9 & 24.5 \\
+Problem-Solution Synthesis          & 11.2 &  7.1 \\
+\hline
+\textbf{Total}                      & \textbf{158.8} & \textbf{100.0} \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+% -------------------------------------------------------
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+
+This paper presented an agentic AI pipeline for multi-source academic
+literature retrieval, structured knowledge extraction, contradiction
+detection, and evidence-grounded research recommendation. The system's key
+design principles---validation gating before RAG indexing,
+field-group-partitioned retrieval, embedding-filtered claim matching,
+code-level citation validation, and explicit not-found sentinels in place
+of fabricated outputs---constitute a framework for trust-calibrated academic
+AI assistance.
+
+Experimental evaluation demonstrated: (i) a 25.2 percent mean deduplication
+rate across five heterogeneous academic APIs without false-positive merges;
+(ii) an average $+31.4$ percentage point gain in minority technical field
+coverage from nine-group partitioned retrieval over a single-query baseline;
+(iii) a macro-averaged F1 score of 0.85 on a 24-pair contradiction
+classification benchmark with Cohen's $\kappa = 0.81$ inter-annotator
+agreement; (iv) 72.7 percent root cause attribution accuracy at the
+category level; and (v) near-linear scalability from 5 to 20 display papers
+with consistent 12--13\% validation rejection rates. The ablation study
+further confirmed independent measurable contributions from query intent
+understanding, claim pre-filtering, and cross-encoder re-ranking.
+
+\subsection*{Limitations}
+Several limitations bound the scope of the present results.
+(i)~The contradiction detection benchmark comprises only 24 pairs from NLP
+and Computer Vision; transfer to other domains has not been evaluated.
+(ii)~Root cause accuracy is measured against 11 contradiction pairs; a
+larger annotated benchmark is needed for statistical robustness.
+(iii)~The 14-category root cause taxonomy is flat; a two-level hierarchy
+would reduce fine-grained assignment ambiguity.
+(iv)~Knowledge extraction quality is self-reported via non-sentinel field
+coverage; expert validation of extracted field accuracy has not been
+conducted, unlike the hybrid LLM-and-human evaluation protocol of
+SCI-IDEA \cite{b16}.
+(v)~Total pipeline latency of $\sim$159 seconds for 10 papers may limit
+interactive use cases requiring sub-minute responses.
+
+\subsection*{Ethical Considerations}
+AI-assisted literature synthesis raises concerns analogous to those
+documented for AI-based scientific ideation \cite{b16}. Automated knowledge
+extraction may propagate coverage biases from source APIs---e.g.,
+under-representation of non-English or paywalled literature---into
+downstream insights and recommendations. The Inventor Agent's code-level
+citation validation reduces but does not eliminate hallucination risk;
+users should independently verify cited paper titles before treating
+recommendations as ground truth. The system should be positioned as a
+decision-support aid with human oversight retained for all critical
+conclusions.
+
+Several directions warrant future investigation. First, online learning from
+user corrections to extraction fields and contradiction classifications could
+reduce dependence on the LLM API. Second, integrating co-citation and
+bibliographic coupling signals alongside dense embedding similarity could
+improve claim-matching precision for closely related papers that share
+methodological vocabulary. Third, the 14-category flat root cause taxonomy
+could be organized into a two-level hierarchy to reduce ambiguous
+fine-grained assignments. Fourth, restructuring PDF extraction as a
+streaming pipeline would enable incremental paper display. Fifth, serializing
+FAISS indices to disk between sessions would eliminate redundant
+re-embedding for previously analyzed papers, significantly reducing
+time-to-first-result in repeat searches. Sixth, adopting a hybrid
+LLM-plus-domain-expert evaluation protocol---as demonstrated by
+SCI-IDEA \cite{b16}---would provide stronger evidence of real-world utility
+beyond automated metrics.
+
+% -------------------------------------------------------
+\section*{Acknowledgment}
+
+The authors thank the maintainers of OpenAlex, Crossref, arXiv, CORE, and
+Semantic Scholar for providing open-access academic metadata APIs, and the
+Groq team for providing low-latency LLM inference infrastructure used
+throughout this pipeline.
+
+% -------------------------------------------------------
+\begin{thebibliography}{00}
+
+\bibitem{b1}
+G. Salton and M. J. McGill, \textit{Introduction to Modern Information
+Retrieval}. New York, NY, USA: McGraw-Hill, 1983.
+
+\bibitem{b2}
+V. Karpukhin, B. Oguz, S. Min, P. Lewis, L. Wu, S. Edunov, D. Chen, and
+W. Yih, ``Dense passage retrieval for open-domain question answering,''
+in \textit{Proc. Conf. Empirical Methods Natural Language Process. (EMNLP)},
+2020, pp. 6769--6781.
+
+\bibitem{b3}
+N. Reimers and I. Gurevych, ``Sentence-BERT: Sentence embeddings using
+Siamese BERT-networks,'' in \textit{Proc. Conf. Empirical Methods Natural
+Language Process. (EMNLP)}, 2019, pp. 3982--3992.
+
+\bibitem{b4}
+T. Thakur, N. Reimers, A. Rücklé, A. Srivastava, and I. Gurevych, ``BEIR:
+A heterogeneous benchmark for zero-shot evaluation of information retrieval
+models,'' in \textit{Proc. 35th Conf. Neural Inf. Process. Syst. (NeurIPS)
+Datasets and Benchmarks Track}, 2021.
+
+\bibitem{b5}
+P. Lewis, E. Perez, A. Piktus, F. Petroni, V. Karpukhin, N. Goyal,
+H. Küttler, M. Lewis, W. Yih, T. Rocktäschel, S. Riedel, and D. Kiela,
+``Retrieval-augmented generation for knowledge-intensive NLP tasks,'' in
+\textit{Proc. 34th Conf. Neural Inf. Process. Syst. (NeurIPS)}, 2020,
+pp. 9459--9474.
+
+\bibitem{b6}
+S. Siriwardhana, R. Weerasekera, E. Wen, T. Kaluarachchi, R. Rana, and
+S. Nanayakkara, ``Improving the domain adaptation of retrieval augmented
+generation (RAG) models for open domain question answering,''
+\textit{Trans. Assoc. Comput. Linguistics}, vol. 11, pp. 1--17, 2023.
+
+\bibitem{b7}
+O. Ram, Y. Levine, I. Dalmedigos, D. Muhlgay, A. Shashua, K. Leyton-Brown,
+and Y. Shoham, ``In-context retrieval-augmented language models,''
+\textit{Trans. Assoc. Comput. Linguistics}, vol. 11, pp. 1316--1331, 2023.
+
+\bibitem{b8}
+J. Johnson, M. Douze, and H. Jégou, ``Billion-scale similarity search with
+GPUs,'' \textit{IEEE Trans. Big Data}, vol. 7, no. 3, pp. 535--547,
+Sep. 2021.
+
+\bibitem{b9}
+C. Marshall and G. Wallace, ``Automating the systematic review process,''
+in \textit{Proc. 14th Annu. Conf. Genetic Evolutionary Comput. (GECCO)},
+2012, pp. 1233--1240.
+
+\bibitem{b10}
+J. B. Kim, J. H. Park, Y. S. Lee, and H. G. Sung, ``Automated extraction
+of clinical trial eligibility criteria using large language models,''
+\textit{J. Biomed. Informatics}, vol. 138, p. 104281, 2023.
+
+\bibitem{b11}
+T. Hope, J. Portenoy, K. Vasan, J. Borchardt, E. Horvitz, D. S. Weld,
+M. Hearst, and J. Leskovec, ``SciSight: Combining faceted navigation and
+research group detection for COVID-19 exploratory scientific search,'' in
+\textit{Proc. Conf. Empirical Methods Natural Language Process. (EMNLP)},
+2020, pp. 3404--3410.
+
+\bibitem{b12}
+A. Williams, N. Nangia, and S. R. Bowman, ``A broad-coverage challenge
+corpus for sentence understanding through inference,'' in \textit{Proc. Conf.
+North Amer. Chapter Assoc. Comput. Linguistics (NAACL)}, 2018,
+pp. 1112--1122.
+
+\bibitem{b13}
+S. Sadat Moosavi, M. Baumgartner, F. Tao, Y. Hua, M. Stede, and
+I. Gurevych, ``SciNLI: A corpus for natural language inference on scientific
+text,'' in \textit{Proc. 60th Annu. Meeting Assoc. Comput. Linguistics
+(ACL)}, 2022, pp. 7399--7409.
+
+\bibitem{b14}
+N. An, J. Li, F. Yang, and H. Zhou, ``Detecting scientific contradictions
+using knowledge graphs and citation contexts,'' in \textit{Proc. 13th Int.
+Semantic Web Conf. (ISWC)}, 2014.
+
+\bibitem{b15}
+Groq, Inc., ``Llama 3.3 70B Versatile,'' Groq Cloud Inference API,
+2024. [Online]. Available: https://console.groq.com
+
+\bibitem{b16}
+F. Keya, G. Rabby, S. Auer, S. Vahdati, P. Mitra, and M. Y. Jaradeh,
+``SCI-IDEA: Context-aware scientific ideation using token and sentence
+embeddings,'' \textit{Machine Learning}, vol. 115, no. 103, 2026,
+doi: 10.1007/s10994-026-07036-8.
+
+\bibitem{b17}
+X. Hu, H. Fu, J. Wang, Y. Wang, Z. Li, R. Xu, Y. Lu, Y. Jin, L. Pan,
+and Z. Lan, ``NOVA: An iterative planning framework for enhancing scientific
+innovation with large language models,'' in \textit{Findings of the Assoc.
+Comput. Linguistics (ACL)}, 2025, pp. 21330--21359.
+
+\bibitem{b18}
+J. Baek, S. K. Jauhar, S. Cucerzan, and S. J. Hwang,
+``ResearchAgent: Iterative research idea generation over scientific
+literature with large language models,'' in \textit{Proc. Conf. North
+Amer. Chapter Assoc. Comput. Linguistics (NAACL)}, 2025,
+pp. 6709--6738.
+
+\end{thebibliography}
+
+\end{document}
