@@ -11,3 +11,4 @@ data/groq_daily_usage.lock
 .agents/
 .claude/
 .streamlit-skills-*/
+.env
