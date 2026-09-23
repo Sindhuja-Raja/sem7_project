@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+venv/
+data/papers/
+data/llm_cache.json
+data/groq_daily_usage.json
+data/groq_daily_usage.lock
+
+# Claude Code / agent tooling metadata - machine-specific, not app source
+.agents/
+.claude/
+.streamlit-skills-*/

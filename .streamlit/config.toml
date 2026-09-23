@@ -1,0 +1,79 @@
+# Research Paper Retrieval System - Theme
+# Deep slate dark mode with indigo accent, Inter font
+
+[theme]
+base = "dark"
+primaryColor = "#6366f1"
+backgroundColor = "#0f172a"
+secondaryBackgroundColor = "#1e293b"
+codeBackgroundColor = "#1e293b"
+textColor = "#f1f5f9"
+linkColor = "#818cf8"
+borderColor = "#334155"
+codeTextColor = "#cbd5e1"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "8px"
+buttonRadius = "8px"
+
+# Typography — Inter for body, JetBrains Mono for code
+font = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+baseFontSize = 14
+baseFontWeight = 400
+codeFontSize = "13px"
+headingFontSizes = ["32px", "24px", "20px", "17px", "14px", "12px"]
+headingFontWeights = [700, 700, 600, 600, 500, 500]
+linkUnderline = false
+
+# Semantic colors
+greenColor  = "#34d399"
+redColor    = "#f87171"
+yellowColor = "#fbbf24"
+orangeColor = "#fb923C"
+blueColor   = "#60a5fa"
+violetColor = "#a78bfa"
+grayColor   = "#94a3b8"
+
+# Chart categorical palette — indigo-first, high-contrast for dark mode
+chartCategoricalColors = [
+    "#6366f1",
+    "#0ea5e9",
+    "#14b8a6",
+    "#f59e0b",
+    "#ef4444",
+    "#8b5cf6",
+    "#22c55e",
+    "#ec4899",
+]
+
+# Sequential heatmap — deep-to-bright indigo
+chartSequentialColors = [
+    "#1e1b4b",
+    "#2e1e6e",
+    "#3730a3",
+    "#4338ca",
+    "#4f46e5",
+    "#6366f1",
+    "#818cf8",
+    "#a5b4fc",
+    "#c7d2fe",
+    "#e0e7ff",
+]
+
+# Dataframe styling
+dataframeBorderColor = "#334155"
+dataframeHeaderBackgroundColor = "#1e293b"
+
+[theme.sidebar]
+backgroundColor = "#0a1120"
+secondaryBackgroundColor = "#1e293b"
+codeBackgroundColor = "#1e293b"
+textColor = "#f1f5f9"
+borderColor = "#334155"
+primaryColor = "#6366f1"
+
+[server]
+runOnSave = true
+fileWatcherType = "auto"
