@@ -512,6 +512,78 @@ def _build_final_recommendation(raw_final: dict) -> List[dict]:
     ]
 
 
+def _most_common_value(overall_analysis: List[dict], category: str) -> str:
+    for row in overall_analysis:
+        if row.get("Category") == category:
+            value = str(row.get("Most Common") or "").strip()
+            if value and value not in (NOT_FOUND_IN_CONTEXT, "Not Reported"):
+                return value
+    return ""
+
+
+def _fallback_final_recommendation(
+    raw_final: dict,
+    overall_analysis: List[dict],
+    field_coverage: List[dict],
+) -> List[dict]:
+    """Fill missing LLM fields from deterministic literature summaries and
+    the same evidence-based best-practice defaults used by the improvement
+    table. A partial LLM response must not render an all-"Not Reported"
+    recommendation when the analysis already contains usable findings."""
+    coverage = {entry.get("field"): entry for entry in field_coverage}
+    metric_value = _most_common_value(overall_analysis, "Most Used Evaluation Metric")
+    if not metric_value:
+        metric_value = _BEST_PRACTICE_FALLBACKS["Evaluation Metrics"][1]
+
+    defaults = {
+        "recommended_ai_technique": _most_common_value(overall_analysis, "Most Used AI Technique")
+            or "Use the best-supported AI technique identified in the literature.",
+        "recommended_ai_model": _most_common_value(overall_analysis, "Most Used AI Model")
+            or "Select a model that is reproducible and supported by the reported evidence.",
+        "recommended_dataset": _most_common_value(overall_analysis, "Most Used Dataset")
+            or _BEST_PRACTICE_FALLBACKS["Dataset"][1],
+        "recommended_framework": _most_common_value(overall_analysis, "Most Used Framework")
+            or "Use a reproducible, openly documented machine-learning framework.",
+        "recommended_evaluation_metrics": metric_value,
+        "recommended_experimental_setup": (
+            "Report the dataset, train/test split, baselines, hardware, hyperparameters, "
+            "training procedure, and evaluation protocol."
+        ),
+        "suggested_research_title": "Evidence-Grounded Research Innovation from Scientific Contradiction Analysis",
+        "expected_advantages": (
+            "Improved reproducibility, fairer comparison, and more complete evaluation "
+            "than the currently reported approaches."
+        ),
+        "possible_risks": (
+            "Results may be affected by incomplete paper reporting, unavailable full text, "
+            "API limitations, and domain shift."
+        ),
+    }
+
+    # When a field is widely missing, make the recommendation explicit
+    # instead of presenting a misleading most-common value.
+    if coverage.get("Dataset", {}).get("missing_count", 0) == coverage.get("Dataset", {}).get("total_papers", 0):
+        defaults["recommended_dataset"] = _BEST_PRACTICE_FALLBACKS["Dataset"][1]
+    if coverage.get("Evaluation Metrics", {}).get("missing_count", 0) == coverage.get("Evaluation Metrics", {}).get("total_papers", 0):
+        defaults["recommended_evaluation_metrics"] = _BEST_PRACTICE_FALLBACKS["Evaluation Metrics"][1]
+
+    if not isinstance(raw_final, dict):
+        raw_final = {}
+    def usable(value: object) -> str:
+        normalized = str(value or "").strip()
+        if normalized in ("", "Not Reported", NOT_FOUND_IN_CONTEXT):
+            return ""
+        return normalized
+
+    return [
+        {
+            "Category": label,
+            "Value": usable(raw_final.get(key)) or defaults[key],
+        }
+        for key, label in _FINAL_RECOMMENDATION_FIELDS
+    ]
+
+
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
@@ -564,7 +636,9 @@ def generate_recommendation(
     known_titles = {p.title for p in papers}
     recommendations = _validate_recommendations(data.get("recommendations"), known_titles)
     improvement_table = _validate_improvement_table(data.get("improvement_table"), known_titles)
-    final_recommendation = _build_final_recommendation(data.get("final_recommendation"))
+    final_recommendation = _fallback_final_recommendation(
+        data.get("final_recommendation"), overall_analysis, field_coverage,
+    )
 
     if not improvement_table:
         improvement_table = _fallback_improvement_table(field_coverage)

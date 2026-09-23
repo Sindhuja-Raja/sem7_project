@@ -95,6 +95,23 @@ def inject_css() -> None:
             background: linear-gradient(90deg, #6366f1, #0ea5e9, #14b8a6);
             border-radius: 14px 14px 0 0;
         }
+        .rs-hero-title {
+            margin: 0;
+            font-size: clamp(1.35rem, 3vw, 2rem);
+            line-height: 1.2;
+            font-weight: 800;
+            overflow-wrap: anywhere;
+            background: linear-gradient(90deg, #a5b4fc, #7dd3fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        /* Keep the main content comfortable on phones and tablets. */
+        [data-testid="stMainBlockContainer"] {
+            width: min(100%, 1440px);
+            padding-left: clamp(1rem, 3vw, 3rem);
+            padding-right: clamp(1rem, 3vw, 3rem);
+        }
 
         /* ---- section header ---- */
         .rs-section-header {
@@ -154,6 +171,23 @@ def inject_css() -> None:
             text-overflow: clip;
             overflow-wrap: anywhere;
             word-break: break-word;
+        }
+
+        @media (max-width: 640px) {
+            .rs-hero {
+                padding: 20px 18px 18px 18px;
+                margin-bottom: 16px;
+            }
+            .rs-agent-row {
+                gap: 8px 14px;
+            }
+            .rs-metric-card {
+                min-width: 82px;
+                padding: 10px 8px;
+            }
+            .rs-metric-value {
+                font-size: 1.25rem;
+            }
         }
         </style>
         """,

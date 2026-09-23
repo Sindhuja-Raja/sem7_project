@@ -78,7 +78,7 @@ if os.environ.get("HF_HUB_OFFLINE", "") not in ("1", "true", "True"):
 
 import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -109,13 +109,7 @@ from root_cause_analysis import analyze_root_causes
 from utils import Paper, deduplicate_papers
 import ui_theme
 
-try:
-    _hero_metric_row = ui_theme.hero_metric_row
-except AttributeError:
-    import importlib
-
-    ui_theme = importlib.reload(ui_theme)
-    _hero_metric_row = getattr(ui_theme, "hero_metric_row", ui_theme.metric_row)
+_hero_metric_row = ui_theme.hero_metric_row
 
 logger = logging.getLogger(__name__)
 
@@ -530,28 +524,8 @@ def main() -> None:
     # ── Hero banner ────────────────────────────────────────────────────────
     st.markdown(
         """
-        <div style="
-            background: linear-gradient(135deg, rgba(99,102,241,0.18) 0%, rgba(14,165,233,0.12) 100%);
-            border: 1px solid rgba(99,102,241,0.30);
-            border-radius: 16px;
-            padding: 28px 32px 22px 32px;
-            margin-bottom: 24px;
-            position: relative;
-            overflow: hidden;
-        ">
-            <div style="position:absolute;top:0;left:0;right:0;height:3px;
-                background:linear-gradient(90deg,#6366f1,#0ea5e9,#14b8a6);
-                border-radius:16px 16px 0 0;"></div>
-            <h1 style="margin:0 0 6px 0;font-size:2rem;font-weight:800;
-                background:linear-gradient(90deg,#a5b4fc,#7dd3fc);
-                -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
-                :material/menu_book: Research Paper Retrieval System
-            </h1>
-            <p style="margin:0;font-size:0.92rem;opacity:0.72;max-width:820px;">
-                Real-time, database-free retrieval from OpenAlex, Crossref, arXiv, CORE"""
-        + (" and Semantic Scholar" if config.ENABLE_SEMANTIC_SCHOLAR else "")
-        + """ — ranked with dense embeddings, cross-encoder re-ranking and LLM explanations.
-            </p>
+        <div class="rs-hero">
+            <h1 class="rs-hero-title">:material/menu_book: Research Paper Retrieval System</h1>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1201,7 +1175,10 @@ def render_problem_solution_analysis(analysis) -> None:
                 st.markdown("**AI Models Used**")
                 ui_theme.chip_row(model_chips, color=ui_theme.category_color(1))
 
-            st.metric("Best Reported Performance", row.get("Best Reported Performance", NOT_FOUND_IN_CONTEXT))
+            st.metric(
+                "Best Reported Performance",
+                row.get("Best Reported Performance", "No reported performance metric"),
+            )
 
             supporting = [p.strip() for p in row.get("Supporting Papers", "").split(", ") if p.strip()]
             if supporting:
@@ -1211,9 +1188,16 @@ def render_problem_solution_analysis(analysis) -> None:
     if analysis.summary:
         st.markdown("**Summary**")
         with st.container(key="problem-solution-summary"):
-            summary_cols = st.columns(len(analysis.summary))
+            # Five full-width metric cards in one row make long values
+            # unreadable on normal browser widths. Two rows preserve the
+            # complete text while remaining responsive.
+            summary_cols = st.columns(3)
             for col, entry in zip(summary_cols, analysis.summary):
                 col.metric(entry["Category"], entry["Value"])
+            if len(analysis.summary) > 3:
+                summary_cols = st.columns(2)
+                for col, entry in zip(summary_cols, analysis.summary[3:]):
+                    col.metric(entry["Category"], entry["Value"])
 
 
 _CLASSIFICATION_ORDER = [
@@ -1746,7 +1730,55 @@ def render_root_cause_tab() -> None:
         if c.classification in ("Contradiction", "Partial Contradiction")
     ]
     if not flagged_pairs:
-        st.info("No contradictions or partial contradictions were detected - nothing to analyze.")
+        if report.comparisons:
+            classification_counts = Counter(c.classification for c in report.comparisons)
+            summary = ", ".join(
+                f"{count} {classification}"
+                for classification, count in classification_counts.items()
+            )
+            st.info(
+                "Root-cause analysis applies only to Contradiction and Partial Contradiction "
+                "pairs. The selected papers produced comparable claims, but none were classified "
+                f"as a contradiction ({summary})."
+            )
+            st.caption(
+                "Review the claim comparisons in the Contradictions tab. Different Context and "
+                "Insufficient Evidence results indicate that the papers were not comparable "
+                "enough to support a defensible root-cause assignment."
+            )
+        elif report.status == pipeline_status.RETRIEVAL_FAILURE:
+            st.warning(
+                "Root-cause analysis could not start because no usable paper text was retrieved. "
+                "Try papers with accessible full text or an available abstract, then run "
+                "Contradiction Detection again."
+            )
+        elif report.status == pipeline_status.EXTRACTION_FAILURE:
+            st.warning(
+                "Root-cause analysis could not start because scientific claims could not be "
+                "extracted. Check the application logs and run Contradiction Detection again."
+            )
+        elif report.status == pipeline_status.LLM_UNAVAILABLE:
+            st.warning(
+                "Root-cause analysis requires the configured LLM. Set GROQ_API_KEY, select at "
+                "least two papers, and run Contradiction Detection again."
+            )
+        elif report.status == pipeline_status.DAILY_QUOTA_EXCEEDED:
+            st.warning(
+                "Root-cause analysis is waiting for the daily LLM quota to reset. No root cause "
+                "was inferred without evidence; try again after the quota becomes available."
+            )
+        elif report.status == pipeline_status.INSUFFICIENT_EVIDENCE:
+            st.info(
+                "No root cause can be assigned because the selected papers did not provide "
+                "enough comparable scientific claims. Select papers with related methods or "
+                "findings and run Contradiction Detection again."
+            )
+        else:
+            st.info(
+                "No contradictions or partial contradictions were detected. Run Contradiction "
+                "Detection first with at least two related papers; root-cause analysis is "
+                "available only when a genuine contradiction is found."
+            )
         return
 
     for c, rc in flagged_pairs:

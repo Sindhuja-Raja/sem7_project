@@ -297,7 +297,7 @@ def _best_performance(paper_titles: set, knowledge_by_title: Dict[str, dict]) ->
             if num > best_num:
                 best_num = num
                 best_display = f"{value} ({metric_col})"
-    return best_display or NOT_REPORTED
+    return best_display or "No reported performance metric"
 
 
 def _build_problem_solution_table(
@@ -350,7 +350,14 @@ def _build_summary(table: List[dict], overall_analysis: List[dict]) -> List[dict
             "Problem With Most Proposed Solutions", "Problem That Remains Least Solved",
         )]
 
-    overall_by_category = {row.get("Category"): row.get("Most Common") for row in overall_analysis}
+    overall_by_category = {
+        row.get("Category"): (
+            "Not reported in evaluated papers"
+            if str(row.get("Most Common") or "").strip() in ("", NOT_REPORTED, "Not Reported")
+            else row.get("Most Common")
+        )
+        for row in overall_analysis
+    }
 
     most_common_problem = max(table, key=lambda r: r["Frequency"])
     most_solutions = max(table, key=lambda r: r["_solution_diversity"])
